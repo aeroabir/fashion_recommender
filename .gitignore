@@ -1,0 +1,6 @@
+.ipynb_checkpoints/
+/__pycache__/
+automl/
+efficientnetv2-b0/
+polyvore-dataset/
+*.tgz
