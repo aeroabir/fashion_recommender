@@ -1,9 +1,10 @@
 import numpy as np
 import tensorflow as tf
 import sys
+from tensorflow.keras.layers import LayerNormalization, Dense
 
-sys.path.insert(0, "/recsys_data/RecSys/fashion/automl/efficientnetv2")
-import effnetv2_model
+# sys.path.insert(0, "/recsys_data/RecSys/fashion/automl/efficientnetv2")
+# import effnetv2_model
 
 
 class image_embedding_layer(tf.keras.layers.Layer):
@@ -49,6 +50,7 @@ def positional_encoding(position, d_model):
 
 # create mask for padding, 0 --> 1 (mask)
 def create_padding_mask(seq):
+
     seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
 
     # add extra dimensions to add the padding
@@ -84,6 +86,8 @@ def scaled_dot_product_attention(q, k, v, mask):
     # scale matmul_qk
     dk = tf.cast(tf.shape(k)[-1], tf.float32)
     scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+
+    # print(scaled_attention_logits.shape, mask.shape)
 
     # add the mask to the scaled tensor.
     if mask is not None:
@@ -248,18 +252,27 @@ class DecoderLayer(tf.keras.layers.Layer):
 
 class Encoder(tf.keras.layers.Layer):
     def __init__(
-        self, num_layers, d_model, num_heads, dff, maximum_position_encoding, rate=0.1
+        self,
+        num_layers,
+        d_model,
+        num_heads,
+        dff,
+        maximum_position_encoding,
+        rate=0.1,
+        activation="linear",
     ):
         super(Encoder, self).__init__()
 
         self.d_model = d_model
         self.num_layers = num_layers
+        self.activation = activation
 
-        # self.embedding = tf.keras.layers.Dense(d_model, activation="relu")
-        image_embedding = image_embedding_layer(
-            dropout=0.2, embedding_dim=256, activation="tanh"
-        )
-        self.embedding = tf.keras.layers.TimeDistributed(image_embedding)
+        # embedding for numerical inputs
+        self.embedding = tf.keras.layers.Dense(d_model, activation=activation)
+        # image_embedding = image_embedding_layer(
+        #     dropout=0.2, embedding_dim=256, activation="tanh"
+        # )
+        # self.embedding = tf.keras.layers.TimeDistributed(image_embedding)
         # self.pos_encoding = positional_encoding(maximum_position_encoding, self.d_model)
 
         self.enc_layers = [
@@ -268,9 +281,10 @@ class Encoder(tf.keras.layers.Layer):
 
         self.dropout = tf.keras.layers.Dropout(rate)
 
-    def call(self, x, training, mask):
+    def call(self, x, training):
 
-        seq_len = tf.shape(x)[1]
+        # seq_len = tf.shape(x)[1]
+        mask = create_padding_mask(tf.reduce_sum(x, axis=-1))
 
         # print("Encoder:", x.shape)
         # adding embedding and position encoding.
@@ -440,3 +454,87 @@ class FFT(tf.keras.layers.Layer):
         iffted = tf.cast(iffted, dtype=tf.float32)
         iffted = tf.keras.layers.Permute((2, 1))(iffted)
         return iffted
+
+
+class RFF(tf.keras.layers.Layer):
+    """
+    Row-wise FeedForward layers.
+    """
+
+    def __init__(self, d):
+        super(RFF, self).__init__()
+
+        self.linear_1 = Dense(d, activation="relu")
+        self.linear_2 = Dense(d, activation="relu")
+        self.linear_3 = Dense(d, activation="relu")
+
+    def call(self, x):
+        """
+        Arguments:
+            x: a float tensor with shape [b, n, d].
+        Returns:
+            a float tensor with shape [b, n, d].
+        """
+        return self.linear_3(self.linear_2(self.linear_1(x)))
+
+
+class MultiHeadAttentionBlock(tf.keras.layers.Layer):
+    def __init__(self, d_model: int, num_heads: int, rff: RFF):
+        super(MultiHeadAttentionBlock, self).__init__()
+        self.multihead = MultiHeadAttention(d_model, num_heads)
+        self.layer_norm1 = LayerNormalization(epsilon=1e-6, dtype="float32")
+        self.layer_norm2 = LayerNormalization(epsilon=1e-6, dtype="float32")
+        self.rff = rff
+
+    def call(self, x, y, mask):
+        """
+        Arguments:
+            x: a float tensor with shape [b, n, d].
+            y: a float tensor with shape [b, m, d].
+        Returns:
+            a float tensor with shape [b, n, d].
+        """
+        z1, z2 = self.multihead(x, y, y, mask)
+
+        h = self.layer_norm1(x + z1)
+        return self.layer_norm2(h + self.rff(h))
+
+
+class SetAttentionBlock(tf.keras.layers.Layer):
+    def __init__(self, d: int, h: int, rff: RFF):
+        super(SetAttentionBlock, self).__init__()
+        self.mab = MultiHeadAttentionBlock(d, h, rff)
+
+    def call(self, x, mask):
+        """
+        Arguments:
+            x: a float tensor with shape [b, n, d].
+        Returns:
+            a float tensor with shape [b, n, d].
+        """
+        return self.mab(x, x, mask)
+
+
+class STEncoder(tf.keras.layers.Layer):
+    def __init__(self, n=2, d=12, m=6, h=6, activation="relu"):
+        super(STEncoder, self).__init__()
+
+        # Embedding part
+        self.linear_1 = Dense(d, activation=activation)
+
+        # Encoding part
+        # self.isab_1 = InducedSetAttentionBlock(d, m, h, RFF(d), RFF(d))
+        # self.isab_2 = InducedSetAttentionBlock(d, m, h, RFF(d), RFF(d))
+
+        self.blocks = []
+        for _ in range(n):
+            self.blocks.append(SetAttentionBlock(d, h, RFF(d)))
+
+    def call(self, x):
+        mask = create_padding_mask(tf.reduce_sum(x, axis=-1))
+        y = self.linear_1(x)
+        for ii in range(len(self.blocks)):
+            y = self.blocks[ii](y, mask)
+        return y
+        # return self.sab_2(self.sab_1(self.linear_1(x), mask), mask)
+        # return self.isab_2(self.isab_1(self.linear_1(x)))

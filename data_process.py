@@ -6,8 +6,12 @@ import sys
 import tensorflow as tf
 import pandas as pd
 import pickle
+import math
 import numpy as np
 import sys
+from transformers import BertTokenizer, BertModel
+
+# import torch
 
 sys.path.insert(0, "/recsys_data/RecSys/fashion/automl/efficientnetv2")
 import effnetv2_model
@@ -54,6 +58,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.item_description = item_description
         self.image_dir = image_dir
         self.get_image_embedding = image_embedding
+        self.image_embedding_dim = 1280
+        self.text_embedding_dim = 768
 
         if self.get_image_embedding:
             with open("effnet2_polyvore.pkl", "rb") as fr:
@@ -66,20 +72,29 @@ class CustomDataGen(tf.keras.utils.Sequence):
             #     ]
             # )
 
+        if not only_image:
+            with open("bert_polyvore.pkl", "rb") as fr:
+                self.text_embedding_dict = pickle.load(fr)
+
     def on_epoch_end(self):
         if self.shuffle:
             self.df = self.df.sample(frac=1).reset_index(drop=True)
 
     def get_texts(self, item_id):
-        item = self.item_description[item_id]  # item attributes
-        return " ".join(
-            [
-                item["url_name"],
-                item["description"],
-                item["title"],
-                item["semantic_category"],
-            ]
-        )
+        return self.text_embedding_dict[item_id]
+        # item = self.item_description[item_id]  # item attributes
+        # text = " ".join(
+        #     [
+        #         item["url_name"],
+        #         item["description"],
+        #         item["title"],
+        #         item["semantic_category"],
+        #     ]
+        # )
+        # inputs = self.tokenizer(text, return_tensors="pt")
+        # outputs = self.text_model(**inputs)
+        # pooled_output = outputs.pooler_output.detach().numpy()[0, :]
+        # return pooled_output
 
     def get_image(self, item_id):
         if self.get_image_embedding:
@@ -107,15 +122,19 @@ class CustomDataGen(tf.keras.utils.Sequence):
                 data.append((text, image))
 
         if self.get_image_embedding:
-            zero_elem = np.zeros(1280)  # np.zeros((1, 1280))
+            zero_elem_image = np.zeros(self.image_embedding_dim)  # np.zeros((1, 1280))
         else:
-            zero_elem = np.zeros(self.input_size)
+            zero_elem_image = np.zeros(self.input_size)
 
+        zeros_image = [zero_elem_image for _ in range(self.max_len - len(data))]
         if self.only_image:
-            zeros = [zero_elem for _ in range(self.max_len - len(data))]
+            return zeros_image + data
         else:
-            zeros = [("empty", zero_elem) for _ in range(self.max_len - len(data))]
-        return zeros + data
+            text_data = [x[0] for x in data]
+            image_data = [x[1] for x in data]
+            zero_elem_text = np.zeros(self.text_embedding_dim)
+            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
+            return (zeros_image + image_data, zeros_text + text_data)
 
     def __get_data(self, batches):
         # Generates data containing batch_size samples
@@ -129,8 +148,14 @@ class CustomDataGen(tf.keras.utils.Sequence):
         #             batch_Y.append(int(y))
 
         #         print(batch_X, batch_Y)
-
-        X_batch = np.asarray([self.__get_input(x) for x in x_batch])
+        if self.only_image:
+            X_batch = np.asarray([self.__get_input(x) for x in x_batch])
+        else:
+            x1x2 = [self.__get_input(x) for x in x_batch]
+            X_batch = (
+                np.asarray([x[0] for x in x1x2]),
+                np.asarray([x[1] for x in x1x2]),
+            )
         y_batch = np.asarray([int(y) for y in y_batch])
 
         return X_batch, y_batch
@@ -141,7 +166,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
         return X, y
 
     def __len__(self):
-        return self.n // self.batch_size
+        return math.ceil(self.n / self.batch_size)
+        # return self.n // self.batch_size
 
 
 class ImageDataGen(tf.keras.utils.Sequence):
@@ -233,7 +259,8 @@ class ImageDataGen(tf.keras.utils.Sequence):
         return X, y
 
     def __len__(self):
-        return self.n // self.batch_size
+        return math.ceil(self.n / self.batch_size)
+        # return self.n // self.batch_size
 
 
 # if __name__ == "__main__":
