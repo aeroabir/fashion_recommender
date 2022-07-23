@@ -117,8 +117,9 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     num_heads = kwargs.get("num_heads", 8)
     dff = kwargs.get("dff", 128)
     rate = kwargs.get("rate", 0.1)
-    components = kwargs.get("components", 1)
     include_fft = kwargs.get("include_fft", False)
+    include_text = kwargs.get("include_text", False)
+    inp_dim2 = kwargs.get("inp_dim2", None)
     seed_value = kwargs.get("seed", 100)
     num_classes = kwargs.get("num_classes", 2)
     lstm_dim = kwargs.get("lstm_dim", 32)
@@ -132,10 +133,24 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     set_seed(seed_value)
 
     inputs, flat = [], []
-    for ii in range(components):
-        t_in, t_flat = transformer_layer(
+    t_in, t_flat = transformer_layer(
+        inp_seq_len,
+        inp_dim,
+        num_layers,
+        d_model,
+        num_heads,
+        dff,
+        inp_seq_len,
+        rate,
+        embedding_activation,
+    )
+    inputs.append(t_in)
+    flat.append(t_flat)
+
+    if include_text:
+        t_in2, t_flat2 = transformer_layer(
             inp_seq_len,
-            inp_dim,
+            inp_dim2,
             num_layers,
             d_model,
             num_heads,
@@ -144,15 +159,8 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
             rate,
             embedding_activation,
         )
-        inputs.append(t_in)
-        flat.append(t_flat)
-
-    if include_fft:
-        fft_layer = FFT(inp_seq_len, 1, 1)
-        fft_out = fft_layer(inputs[0])
-        flat.append(fft_out)
-
-    if components > 1:
+        inputs.append(t_in2)
+        flat.append(t_flat2)
         merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
     else:
         merge = flat[0]
@@ -180,7 +188,8 @@ def build_set_transformer(inp_seq_len, inp_dim, **kwargs):
     num_induce = kwargs.get("num_induce", 6)
     dff = kwargs.get("dff", 128)
     rate = kwargs.get("rate", 0.1)
-    components = kwargs.get("components", 1)
+    include_text = kwargs.get("include_text", False)
+    inp_dim2 = kwargs.get("inp_dim2", None)
     seed_value = kwargs.get("seed", 100)
     num_classes = kwargs.get("num_classes", 2)
     lstm_dim = kwargs.get("lstm_dim", 32)
@@ -209,6 +218,26 @@ def build_set_transformer(inp_seq_len, inp_dim, **kwargs):
     )(x)
     # output = STDecoder(out_dim=1, d=d_model, h=num_heads, k=1)(y)
 
+    if include_text:
+        inp2 = Input(
+            shape=(
+                inp_seq_len,
+                inp_dim2,
+            )
+        )
+        x2 = Dense(d_model, activation="linear")(inp2)
+        y2 = STEncoder(
+            n=num_layers,
+            d=d_model,
+            m=num_induce,
+            h=num_heads,
+            activation=embedding_activation,
+        )(x2)
+        y = concatenate([y, y2], axis=-1)
+        inps = [inp1, inp2]
+    else:
+        inps = inp1
+
     lstm_out = LSTM(lstm_dim, activation=lstm_activation, return_sequences=False)(y)
     # lstm_out = Dropout(0.2)(lstm_out)
     if num_classes == 2:
@@ -216,5 +245,5 @@ def build_set_transformer(inp_seq_len, inp_dim, **kwargs):
     else:
         output = Dense(num_classes, activation="softmax")(lstm_out)
 
-    model = Model(inputs=inp1, outputs=output, name="set_transformer")
+    model = Model(inputs=inps, outputs=output, name="set_transformer")
     return model

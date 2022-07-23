@@ -7,3 +7,7 @@ polyvore-dataset/
 *.pkl
 *.pickle
 /wandb/
+/finetuned_efficientnet/
+/logs/
+/stellargraph/
+/visual-compatibility/

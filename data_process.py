@@ -41,6 +41,9 @@ class CustomDataGen(tf.keras.utils.Sequence):
         input_size=(224, 224, 3),
         only_image=True,
         image_embedding=True,
+        image_embedding_dim=1280,
+        image_embedding_file=None,
+        text_embedding_file=None,
         shuffle=True,
     ):
         self.df = pd.DataFrame({"X": X, "y": y})
@@ -58,11 +61,15 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.item_description = item_description
         self.image_dir = image_dir
         self.get_image_embedding = image_embedding
-        self.image_embedding_dim = 1280
+        self.image_embedding_dim = image_embedding_dim
         self.text_embedding_dim = 768
+        self.image_embedding_file = image_embedding_file
 
         if self.get_image_embedding:
-            with open("effnet2_polyvore.pkl", "rb") as fr:
+            # "effnet2_polyvore.pkl" - 1280 dimensional vector
+            # "graphsage_dict_polyvore.pkl" - 50 dimension
+            # "graphsage_dict2_polyvore.pkl" - 50 dimension
+            with open(image_embedding_file, "rb") as fr:
                 self.embedding_dict = pickle.load(fr)
 
             # self.model = tf.keras.models.Sequential(
@@ -73,7 +80,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
             # )
 
         if not only_image:
-            with open("bert_polyvore.pkl", "rb") as fr:
+            # "bert_polyvore.pkl" - 768 dimensional vector
+            with open(text_embedding_file, "rb") as fr:
                 self.text_embedding_dict = pickle.load(fr)
 
     def on_epoch_end(self):
@@ -114,11 +122,11 @@ class CustomDataGen(tf.keras.utils.Sequence):
         data = []
         items = [self.item_dict[x] for x in example]
         for item in items:
-            text = self.get_texts(item)
             image = self.get_image(item)
             if self.only_image:
                 data.append(image)
             else:
+                text = self.get_texts(item)
                 data.append((text, image))
 
         if self.get_image_embedding:
