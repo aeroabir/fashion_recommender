@@ -44,6 +44,10 @@ class CustomDataGen(tf.keras.utils.Sequence):
         image_embedding_dim=1280,
         image_embedding_file=None,
         text_embedding_file=None,
+        return_item_categories=False,
+        return_negative_samples=False,
+        number_negative_samples=0,
+        label_dict=None,
         shuffle=True,
     ):
         self.df = pd.DataFrame({"X": X, "y": y})
@@ -64,9 +68,24 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.image_embedding_dim = image_embedding_dim
         self.text_embedding_dim = 768
         self.image_embedding_file = image_embedding_file
+        self.return_item_categories = return_item_categories
+        self.return_negative_samples = return_negative_samples
+        self.number_negative_samples = number_negative_samples
+        self.label_dict = label_dict
+
+        if self.return_negative_samples:
+            self.items_by_category, self.item2cat = {}, {}
+            for item, desc in self.item_description.items():
+                cat = desc["category_id"]
+                self.item2cat[item] = cat
+                if cat in self.items_by_category:
+                    self.items_by_category[cat].append(item)
+                else:
+                    self.items_by_category[cat] = [item]
 
         if self.get_image_embedding:
             # "effnet2_polyvore.pkl" - 1280 dimensional vector
+            # "effnet_tuned_polyvore.pkl" - 1280 dimensional vector
             # "graphsage_dict_polyvore.pkl" - 50 dimension
             # "graphsage_dict2_polyvore.pkl" - 50 dimension
             with open(image_embedding_file, "rb") as fr:
@@ -83,6 +102,9 @@ class CustomDataGen(tf.keras.utils.Sequence):
             # "bert_polyvore.pkl" - 768 dimensional vector
             with open(text_embedding_file, "rb") as fr:
                 self.text_embedding_dict = pickle.load(fr)
+
+        # original data has all positives followed by all negatives
+        self.on_epoch_end()
 
     def on_epoch_end(self):
         if self.shuffle:
@@ -118,9 +140,23 @@ class CustomDataGen(tf.keras.utils.Sequence):
         # return tf.squeeze(self.model(tf.expand_dims(image_arr, 0)))
         return image_arr
 
+    def get_negative_samples(self, item_id, num_negative):
+        # get items from the same category
+        item_cat = self.item2cat[item_id]
+        item_pool = self.items_by_category[item_cat].copy()
+        try:
+            item_pool.remove(item_id)
+        except:
+            print("cannot find!!")
+            print(item_id, item_cat)
+            print(item_pool)
+        neg_items = np.random.randint(low=0, high=len(item_pool), size=num_negative)
+        neg_items = [item_pool[ii] for ii in neg_items]
+        return neg_items
+
     def __get_input(self, example):
-        data = []
-        items = [self.item_dict[x] for x in example]
+        data, nimage_data, ntext_data = [], [], []
+        items = [self.item_dict[x] for x in example[: self.max_len]]
         for item in items:
             image = self.get_image(item)
             if self.only_image:
@@ -128,6 +164,41 @@ class CustomDataGen(tf.keras.utils.Sequence):
             else:
                 text = self.get_texts(item)
                 data.append((text, image))
+
+            if self.return_negative_samples:
+                neg_images, neg_texts = [], []
+                neg_items = self.get_negative_samples(
+                    item, self.number_negative_samples
+                )
+                for item_jj in neg_items:
+                    image = self.get_image(item_jj)
+                    text = self.get_texts(item_jj)
+                    neg_images.append(image)
+                    neg_texts.append(text)
+                neg_images = np.array(neg_images)
+                neg_texts = np.array(neg_texts)
+                nimage_data.append(neg_images)
+                ntext_data.append(neg_texts)
+
+        if self.return_negative_samples:
+            zero_elem_image = np.zeros(
+                (self.number_negative_samples, self.image_embedding_dim)
+            )
+            zero_elem_text = np.zeros(
+                (self.number_negative_samples, self.text_embedding_dim)
+            )
+            zeros_image = [
+                zero_elem_image for _ in range(self.max_len - len(nimage_data))
+            ]
+            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
+
+            nimage_data = zeros_image + nimage_data
+            ntext_data = zeros_text + ntext_data
+
+            # nimage_data = np.array(nimage_data)
+            # ntext_data = np.array(ntext_data)
+            # print(nimage_data.shape, ntext_data.shape)
+            # sys.exit()
 
         if self.get_image_embedding:
             zero_elem_image = np.zeros(self.image_embedding_dim)  # np.zeros((1, 1280))
@@ -142,7 +213,25 @@ class CustomDataGen(tf.keras.utils.Sequence):
             image_data = [x[1] for x in data]
             zero_elem_text = np.zeros(self.text_embedding_dim)
             zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
-            return (zeros_image + image_data, zeros_text + text_data)
+
+            if not self.return_negative_samples:
+                return (zeros_image + image_data, zeros_text + text_data)
+            else:
+                return (
+                    zeros_image + image_data,
+                    zeros_text + text_data,
+                    nimage_data,
+                    ntext_data,
+                )
+
+    def __get_label1(self, example):
+        items = [self.item_dict[x] for x in example[: self.max_len]]
+        data = []
+        for item in items:
+            data.append(self.label_dict[self.item_description[item]["category_id"]])
+        if len(data) < self.max_len:
+            data = [-1] * (self.max_len - len(data)) + data
+        return data
 
     def __get_data(self, batches):
         # Generates data containing batch_size samples
@@ -159,12 +248,28 @@ class CustomDataGen(tf.keras.utils.Sequence):
         if self.only_image:
             X_batch = np.asarray([self.__get_input(x) for x in x_batch])
         else:
-            x1x2 = [self.__get_input(x) for x in x_batch]
-            X_batch = (
-                np.asarray([x[0] for x in x1x2]),
-                np.asarray([x[1] for x in x1x2]),
-            )
+            combined = [self.__get_input(x) for x in x_batch]
+            if self.return_negative_samples:
+                X_batch = (
+                    np.asarray([x[0] for x in combined]),
+                    np.asarray([x[1] for x in combined]),
+                    np.asarray([x[2] for x in combined]),
+                    np.asarray([x[3] for x in combined]),
+                )
+            else:
+                X_batch = (
+                    np.asarray([x[0] for x in combined]),
+                    np.asarray([x[1] for x in combined]),
+                )
         y_batch = np.asarray([int(y) for y in y_batch])
+
+        if self.return_item_categories:
+            y2_batch = np.asarray([self.__get_label1(x) for x in x_batch])
+            y_batch = [y_batch, y2_batch]
+
+        if self.return_negative_samples:
+            y3_batch = np.zeros((len(x_batch), 1))
+            y_batch.append(y3_batch)
 
         return X_batch, y_batch
 

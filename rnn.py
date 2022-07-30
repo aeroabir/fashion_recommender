@@ -250,91 +250,231 @@ def build_multiscale_rnn(inp_seq_lens, inp_features, tgt_seq_len, **kwargs):
     return model
 
 
-def build_multitask_rnn(inp_seq_len, inp_features, tgt_seq_len, **kwargs):
+def build_multitask_rnn(inp_seq_len, inp_features, **kwargs):
     """
-    There are two models - (1) to predict the covariates and (2) to predict
+    There are two outputs - (1) to predict the covariates and (2) to predict
     radiation using the prediction of the first model as future covariates
+    There is only one model though.
     """
-    tgt_features1 = kwargs.get("tgt_features1", 1)  # targets for the first model
-    tgt_features2 = kwargs.get("tgt_features2", 1)  # targets for the second model
-
-    rnn = kwargs.get("rnn", "lstm-lstm")
+    num_classes = kwargs.get("num_classes", 2)
+    rnn = kwargs.get("rnn", "lstm")
     num_layers = kwargs.get("num_layers", 2)
     d_model = kwargs.get("d_model", 128)
-    d_model2 = kwargs.get("d_model2", 16)
-    d_model3 = kwargs.get("d_model3", 16)
     seed_value = kwargs.get("seed", 100)
     rate = kwargs.get("rate", 0.1)
-    components = kwargs.get("components", 2)
-    future_covariates = kwargs.get("future_covariates", False)
-    dim_future_cov = kwargs.get("dim_future_cov", 1)
-    quantiles = kwargs.get("quantiles", None)
-    model_name1 = kwargs.get("model_name1", "future_output")
-    model_name2 = kwargs.get("model_name2", "radiation_output")
+    model_name = kwargs.get("model_name", "rnn")
+    merge_activation = kwargs.get("merge_activation", "relu")
+    final_activation = kwargs.get("final_activation", None)
+    include_text = kwargs.get("include_text", False)
+    text_feature_dim = kwargs.get("text_feature_dim", 768)
+    model_name1 = kwargs.get("model_name1", "item_classification")
+    model_name2 = kwargs.get("model_name2", "compatibility")
 
     seed(seed_value)
     set_seed(seed_value)
 
-    inputs = []
-    for _ in range(components):
-        in1 = Input(
-            shape=(
-                inp_seq_len,
-                inp_features,
-            )
-        )
-        inputs.append(in1)
-
-    if future_covariates:
-        decoder_inputs1 = Input(
-            shape=(
-                tgt_seq_len,
-                dim_future_cov,
-            )
-        )
-        inputs1 = inputs.copy()
-        inputs1.append(decoder_inputs1)
-
-    # First model - without covariates
-    model1 = build_multilevel_rnn_unequal(
-        inp_seq_len=inp_seq_len,
-        inp_features=inp_features,
-        tgt_seq_len=tgt_seq_len,
-        tgt_features=tgt_features1,
-        components=components,
-        num_layers=num_layers,
-        d_model=d_model,
-        d_model2=d_model2,
-        d_model3=d_model3,
-        rnn=rnn,
-        future_covariates=future_covariates,
-        dim_future_cov=dim_future_cov,
-        model_name=model_name1,
+    inputs, flat = [], []
+    # for image
+    t_in1, t_flat1 = rnn_layer(
+        rnn, inp_seq_len, inp_features, num_layers, d_model, rate
     )
+    inputs.append(t_in1)
+    flat.append(t_flat1)
 
-    o1 = model1(inputs1)
-    # model = Model(inputs=inputs1, outputs=o1)
-    # return model
+    if include_text:
+        t_in2, t_flat2 = rnn_layer(
+            rnn, inp_seq_len, text_feature_dim, num_layers, d_model, rate
+        )
+        inputs.append(t_in2)
+        flat.append(t_flat2)
 
-    # Second model - output of the first model as future covariates
-    model2 = build_multilevel_rnn_unequal(
-        inp_seq_len=inp_seq_len,
-        inp_features=inp_features,
-        tgt_seq_len=tgt_seq_len,
-        tgt_features=tgt_features2,
-        components=components,
-        num_layers=num_layers,
-        d_model=d_model,
-        d_model2=d_model2,
-        d_model3=d_model3,
-        rnn=rnn,
-        future_covariates=True,
-        dim_future_cov=dim_future_cov + tgt_features1,
-        model_name=model_name2,
+    components = len(flat)
+    if components > 1:
+        merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
+    else:
+        merge = flat[0]
+    # merge = BatchNormalization()(merge)
+
+    classification_layers = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.Dense(153, activation="softmax"),
+        ]
     )
-    decoder_inputs2 = concatenate([o1, decoder_inputs1], axis=-1)
-    inputs.append(decoder_inputs2)
-    o2 = model2(inputs)
+    class_probs = tf.keras.layers.TimeDistributed(
+        classification_layers, name=model_name1
+    )(merge)
+    # should be batch X sequence_length X #classes
 
-    model = Model(inputs=inputs1, outputs=[o1, o2])
+    # convert to the target_sequence_length
+    merge = Permute((2, 1), input_shape=(inp_seq_len, components * d_model))(merge)
+    merge = Dense(1, activation=merge_activation)(merge)
+    merge = tf.squeeze(merge, axis=-1)
+
+    if num_classes == 2:
+        dense1 = Dense(1, activation=final_activation, name=model_name2)(merge)
+    else:
+        dense1 = Dense(num_classes, activation="softmax", name=model_name2)(merge)
+
+    model = Model(inputs=inputs, outputs=[dense1, class_probs], name=model_name)
     return model
+
+
+# create mask for padding, 0 --> 1 (mask)
+def create_padding_mask(seq, add_extra=False):
+
+    # seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
+    seq = tf.cast(tf.math.greater(seq, 0), tf.float32)
+
+    if add_extra:
+        # add extra dimensions to add the padding
+        # to the attention logits.
+        return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+    else:
+        return seq
+
+
+def normalize(x):
+    x_ = x / tf.expand_dims(tf.norm(x, axis=-1), axis=-1)
+    return x_
+
+
+class MultiTaskRNN(tf.keras.Model):
+    """
+    RNN based model with multiple tasks,
+    (1) compatibility label prediction, binary
+    (2) item category prediction, multi-class
+    (3) visual semantic embedding
+    """
+
+    def __init__(self, **kwargs):
+        super(MultiTaskRNN, self).__init__()
+        self.num_layers = kwargs.get("num_layers", 3)
+        self.rnn = kwargs.get("rnn", "lstm")
+        self.num_layers = kwargs.get("num_layers", 2)
+        self.d_model = kwargs.get("d_model", 256)
+        self.include_text = kwargs.get("include_text", True)
+        self.first_activation = kwargs.get("first_activation", "tanh")
+        self.embedding_activation = kwargs.get("embedding_activation", "linear")
+        self.lstm_dim = kwargs.get("lstm_dim", 32)
+        self.lstm_activation = kwargs.get("lstm_activation", "relu")
+        self.final_activation = kwargs.get("final_activation", "sigmoid")
+        self.num_classes = kwargs.get("num_classes", 2)
+        self.num_categories = kwargs.get("num_categories", 153)
+        self.model_name1 = kwargs.get("model_name1", "item_classification")
+        self.model_name2 = kwargs.get("model_name2", "compatibility")
+        self.margin = kwargs.get("margin", 0.2)
+        # tf.keras.backend.set_floatx("float32")
+
+        self.image_embedding = Dense(self.d_model, activation=self.first_activation)
+        self.text_embedding = Dense(self.d_model, activation=self.first_activation)
+
+        return_seq = True
+        if self.rnn == "lstm":
+            unit_encoder = LSTM(
+                units=self.d_model, activation="tanh", return_sequences=return_seq
+            )
+        elif self.rnn == "gru":
+            unit_encoder = GRU(units=self.d_model, return_sequences=return_seq)
+        elif self.rnn == "bilstm":
+            base_rnn = LSTM(
+                units=self.d_model, activation="tanh", return_sequences=return_seq
+            )
+            unit_encoder = Bidirectional(base_rnn, merge_mode="concat")
+        elif self.rnn == "bigru":
+            base_rnn = GRU(units=self.d_model, return_sequences=return_seq)
+            unit_encoder = Bidirectional(base_rnn, merge_mode="concat")
+
+        self.image_encoder = tf.keras.models.Sequential()
+        for _ in range(self.num_layers):
+            self.image_encoder.add(unit_encoder)
+
+        self.text_encoder = tf.keras.models.Sequential()
+        for _ in range(self.num_layers):
+            self.text_encoder.add(unit_encoder)
+
+        classification_layers = tf.keras.models.Sequential(
+            [
+                tf.keras.layers.Dense(self.num_categories, activation="softmax"),
+            ]
+        )
+        self.time_distributed = tf.keras.layers.TimeDistributed(
+            classification_layers, name=self.model_name1
+        )
+        self.rnn = LSTM(
+            self.lstm_dim, activation=self.lstm_activation, return_sequences=False
+        )
+        if self.num_classes == 2:
+            self.output_layer = Dense(
+                1, activation=self.final_activation, name=self.model_name2
+            )
+        else:
+            self.output_layer = Dense(
+                self.num_classes, activation="softmax", name=self.model_name2
+            )
+
+    def call(self, x):
+        inp_image, inp_text, neg_image, neg_text = x
+        # mask = create_padding_mask(tf.reduce_sum(inp_image, axis=-1))
+
+        # outfit images and texts
+        embedded_image = self.image_embedding(inp_image)
+        embedded_text = self.text_embedding(inp_text)
+
+        encoded_image = self.image_encoder(embedded_image)
+        encoded_text = self.text_encoder(embedded_text)
+        combined_image_text = concatenate([encoded_image, encoded_text], axis=-1)
+        lstm_out = self.rnn(combined_image_text)
+        compatibility_output = self.output_layer(lstm_out)
+        class_probs = self.time_distributed(combined_image_text)
+
+        # for contrastive loss
+        # process negative image and text samples
+        neg_image_embedded = self.image_embedding(neg_image)
+        neg_text_embedded = self.text_embedding(neg_text)
+
+        # normalize all the embeddings
+        # embedded_image = tf.keras.utils.normalize(embedded_image, axis=-1)
+        # embedded_text = tf.keras.utils.normalize(embedded_text, axis=-1)
+        # neg_image_embedded = tf.keras.utils.normalize(neg_image_embedded, axis=-1)
+        # neg_text_embedded = tf.keras.utils.normalize(neg_text_embedded)
+        # embedded_image = normalize(embedded_image)
+        # embedded_text = normalize(embedded_text)
+        # neg_image_embedded = normalize(neg_image_embedded)
+        # neg_text_embedded = normalize(neg_text_embedded)
+
+        # positive image-text
+        positive_prod = tf.keras.layers.Multiply()([embedded_image, embedded_text])
+        positive_prod = tf.reduce_sum(positive_prod, axis=-1)
+
+        # image vs negative texts, element-wise multiplication
+        negative_image_text = tf.keras.layers.Multiply()(
+            [embedded_image, neg_text_embedded]
+        )  # (?, s, n, 256)
+        negative_image_text = tf.reduce_sum(negative_image_text, axis=-1)
+        negative_image_text = tf.reduce_sum(negative_image_text, axis=-1)
+
+        # text vs negative images
+        negative_text_image = tf.keras.layers.Multiply()(
+            [embedded_text, neg_image_embedded]
+        )
+        negative_text_image = tf.reduce_sum(negative_text_image, axis=-1)
+        negative_text_image = tf.reduce_sum(negative_text_image, axis=-1)
+
+        #  positive_prod.shape = (32, 8), negative_text_image.shape = (32, 8)
+        contrastive_loss_1 = self.margin - positive_prod + negative_image_text
+        condition_1 = tf.less(contrastive_loss_1, 0.0)
+        loss_1 = tf.where(
+            condition_1, tf.zeros_like(contrastive_loss_1), contrastive_loss_1
+        )
+
+        contrastive_loss_2 = self.margin - positive_prod + negative_text_image
+        condition_2 = tf.less(contrastive_loss_2, 0.0)
+        loss_2 = tf.where(
+            condition_2, tf.zeros_like(contrastive_loss_2), contrastive_loss_2
+        )
+        contrastive_loss = loss_1 + loss_2
+
+        # print(negative_text_image.shape, negative_image_text.shape, positive_prod.shape)
+        # print(loss_1.shape, loss_2.shape)
+
+        return compatibility_output, class_probs, contrastive_loss
