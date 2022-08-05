@@ -1,3 +1,4 @@
+# import effnetv2_model
 import glob
 import json
 import matplotlib.pyplot as plt
@@ -14,7 +15,6 @@ from transformers import BertTokenizer, BertModel
 # import torch
 
 sys.path.insert(0, "/recsys_data/RecSys/fashion/automl/efficientnetv2")
-import effnetv2_model
 
 base_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/polyvore_outfits"
 train_dir = os.path.join(base_dir, "disjoint")
@@ -47,12 +47,14 @@ class CustomDataGen(tf.keras.utils.Sequence):
         return_item_categories=False,
         return_negative_samples=False,
         number_negative_samples=0,
+        number_items_in_batch=None,
+        variable_length_input=True,
         label_dict=None,
         shuffle=True,
     ):
         self.df = pd.DataFrame({"X": X, "y": y})
-        self.X = self.df["X"].tolist()
-        self.y = self.df["y"].tolist()
+        # self.X = self.df["X"].tolist()
+        # self.y = self.df["y"].tolist()
         self.X_col = "X"
         self.y_col = "y"
         self.batch_size = batch_size
@@ -72,6 +74,15 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.return_negative_samples = return_negative_samples
         self.number_negative_samples = number_negative_samples
         self.label_dict = label_dict
+        self.number_items_in_batch = number_items_in_batch
+        self.variable_length_input = variable_length_input
+
+        if not self.variable_length_input:
+            # filter examples where the number of items in a
+            # sequence is lesser than the max_len
+            self.df["seq_len"] = self.df[self.X_col].apply(lambda x: len(x))
+            self.df = self.df[self.df["seq_len"] == self.max_len]
+            self.n = len(self.df)
 
         if self.return_negative_samples:
             self.items_by_category, self.item2cat = {}, {}
@@ -150,7 +161,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
             print("cannot find!!")
             print(item_id, item_cat)
             print(item_pool)
-        neg_items = np.random.randint(low=0, high=len(item_pool), size=num_negative)
+        neg_items = np.random.randint(
+            low=0, high=len(item_pool), size=num_negative)
         neg_items = [item_pool[ii] for ii in neg_items]
         return neg_items
 
@@ -190,7 +202,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
             zeros_image = [
                 zero_elem_image for _ in range(self.max_len - len(nimage_data))
             ]
-            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
+            zeros_text = [zero_elem_text for _ in range(
+                self.max_len - len(data))]
 
             nimage_data = zeros_image + nimage_data
             ntext_data = zeros_text + ntext_data
@@ -201,18 +214,21 @@ class CustomDataGen(tf.keras.utils.Sequence):
             # sys.exit()
 
         if self.get_image_embedding:
-            zero_elem_image = np.zeros(self.image_embedding_dim)  # np.zeros((1, 1280))
+            zero_elem_image = np.zeros(
+                self.image_embedding_dim)  # np.zeros((1, 1280))
         else:
             zero_elem_image = np.zeros(self.input_size)
 
-        zeros_image = [zero_elem_image for _ in range(self.max_len - len(data))]
+        zeros_image = [zero_elem_image for _ in range(
+            self.max_len - len(data))]
         if self.only_image:
             return zeros_image + data
         else:
             text_data = [x[0] for x in data]
             image_data = [x[1] for x in data]
             zero_elem_text = np.zeros(self.text_embedding_dim)
-            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
+            zeros_text = [zero_elem_text for _ in range(
+                self.max_len - len(data))]
 
             if not self.return_negative_samples:
                 return (zeros_image + image_data, zeros_text + text_data)
@@ -225,26 +241,57 @@ class CustomDataGen(tf.keras.utils.Sequence):
                 )
 
     def __get_label1(self, example):
+        # creates labels for item classification
+        # padded witn -1 to maintain the same sequence length
         items = [self.item_dict[x] for x in example[: self.max_len]]
         data = []
         for item in items:
-            data.append(self.label_dict[self.item_description[item]["category_id"]])
+            data.append(
+                self.label_dict[self.item_description[item]["category_id"]])
         if len(data) < self.max_len:
             data = [-1] * (self.max_len - len(data)) + data
         return data
+
+    def __get_label2(self, example, batch_dict):
+        # creates labels for *next* item classification
+        # padded witn -1 to maintain the same sequence length
+        items = [self.item_dict[x] for x in example[: self.max_len]]
+        targets = items[1:] + ['eos']
+        data = []
+        for t in targets:
+            if t in batch_dict:
+                data.append(batch_dict[t])
+            else:
+                data.append(batch_dict['unk'])
+        if len(data) < self.max_len:
+            data = [-1] * (self.max_len - len(data)) + data
+        return data
+
+    def __get_mask(self, example):
+        # creates masks for sequential input
+        # 1 for padded items and 0 for true items
+        mask = [0.0 for x in example[: self.max_len]]
+        if len(mask) < self.max_len:
+            mask = [1.0] * (self.max_len - len(mask)) + mask
+        return mask
 
     def __get_data(self, batches):
         # Generates data containing batch_size samples
         x_batch = batches["X"].tolist()
         y_batch = batches["y"].tolist()
 
-        #         batch_X, batch_Y = [], []
-        #         for x, y in zip(x_batch, y_batch):
-        #             x_num = self.__get_input(x)
-        #             batch_X.append(np.vstack(x_num))
-        #             batch_Y.append(int(y))
+        # get all the items for this batch and create a
+        # a label dict (dynamic)
+        batch_items = set()
+        for example in x_batch:
+            batch_items |= set([self.item_dict[x]
+                               for x in example[: self.max_len]])
+        batch_items = list(batch_items)[:self.number_items_in_batch]
+        batch_dict = {jj: ii for ii, jj in enumerate(batch_items)}
+        batch_dict['unk'] = len(batch_items)
+        batch_dict['eos'] = len(batch_items) + 1
 
-        #         print(batch_X, batch_Y)
+        # mask = np.asarray([self.__get_mask(x) for x in x_batch])
         if self.only_image:
             X_batch = np.asarray([self.__get_input(x) for x in x_batch])
         else:
@@ -260,21 +307,29 @@ class CustomDataGen(tf.keras.utils.Sequence):
                 X_batch = (
                     np.asarray([x[0] for x in combined]),
                     np.asarray([x[1] for x in combined]),
+                    # mask,
                 )
+
         y_batch = np.asarray([int(y) for y in y_batch])
+        if not self.return_item_categories and not self.return_negative_samples:
+            y_total = y_batch
 
         if self.return_item_categories:
-            y2_batch = np.asarray([self.__get_label1(x) for x in x_batch])
-            y_batch = [y_batch, y2_batch]
+            y2_batch = np.asarray(
+                [self.__get_label2(x, batch_dict) for x in x_batch])
+            # y2_batch = np.asarray([self.__get_label1(x) for x in x_batch])
+            y_total = [y_batch, y2_batch]
 
         if self.return_negative_samples:
             y3_batch = np.zeros((len(x_batch), 1))
-            y_batch.append(y3_batch)
+            # y3_batch = y2_batch
+            y_total.append(y3_batch)
 
-        return X_batch, y_batch
+        return X_batch, y_total
 
     def __getitem__(self, index):
-        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
+        batches = self.df[index *
+                          self.batch_size: (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
@@ -367,7 +422,110 @@ class ImageDataGen(tf.keras.utils.Sequence):
         return x_batch, y_batch
 
     def __getitem__(self, index):
-        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
+        batches = self.df[index *
+                          self.batch_size: (index + 1) * self.batch_size]
+        X, y = self.__get_data(batches)
+        return X, y
+
+    def __len__(self):
+        return math.ceil(self.n / self.batch_size)
+        # return self.n // self.batch_size
+
+
+class OutfitGen(tf.keras.utils.Sequence):
+    def __init__(
+        self,
+        embed_dir,
+        image_embed_file,
+        text_embed_file,
+        batch_size,
+        max_len,
+        image_embedding_dim,
+        query_item,
+        shuffle=False,
+    ):
+
+        image_embedding_file = os.path.join(embed_dir, image_embed_file)
+        with open(image_embedding_file, "rb") as fr:
+            self.image_embedding_dict = pickle.load(fr)
+
+        text_embedding_file = os.path.join(embed_dir, text_embed_file)
+        with open(text_embedding_file, "rb") as fr:
+            self.text_embedding_dict = pickle.load(fr)
+
+        common_items = set(self.image_embedding_dict.keys()).intersection(
+            self.text_embedding_dict.keys())
+
+        if type(query_item) is not list:
+            query_item = [query_item]
+
+        X, y = [], []
+        for item in common_items:
+            if item not in query_item:
+                X.append([item] + query_item)
+                y.append(item)
+
+        self.X_col = "X"
+        self.y_col = "y"
+        self.df = pd.DataFrame({self.X_col: X, self.y_col: y})
+        self.batch_size = batch_size
+        self.max_len = max_len
+        self.image_embedding_dim = image_embedding_dim
+        self.text_embedding_dim = 768
+        self.shuffle = shuffle
+        self.n = len(self.df)
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+    def get_texts(self, item_id):
+        return self.text_embedding_dict[item_id]
+
+    def get_image(self, item_id):
+        return self.image_embedding_dict[item_id]
+
+    def __get_input(self, example):
+        data = []
+        items = [x for x in example[: self.max_len]]
+        for item in items:
+            image = self.get_image(item)
+            text = self.get_texts(item)
+            data.append((text, image))
+
+        text_data = [x[0] for x in data]
+        image_data = [x[1] for x in data]
+        zero_elem_image = np.zeros(
+            self.image_embedding_dim)  # np.zeros((1, 1280))
+        zero_elem_text = np.zeros(self.text_embedding_dim)
+        zeros_image = [zero_elem_image for _ in range(
+            self.max_len - len(data))]
+        zeros_text = [zero_elem_text for _ in range(
+            self.max_len - len(data))]
+
+        return (zeros_image + image_data, zeros_text + text_data)
+
+    def __get_output(self, label):
+        return self.label_dict[label]
+
+    def __get_data(self, batches):
+        # Generates data containing batch_size samples
+        x_batch = batches["X"].tolist()
+        y_batch = batches["y"].tolist()
+
+        combined = [self.__get_input(x) for x in x_batch]
+        X_batch = (
+            np.asarray([x[0] for x in combined]),
+            np.asarray([x[1] for x in combined]),
+            # mask,
+        )
+        y_batch = np.asarray([int(y) for y in y_batch])
+
+        return X_batch, y_batch
+
+    def __getitem__(self, index):
+        batches = self.df[index *
+                          self.batch_size: (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
