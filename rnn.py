@@ -21,21 +21,21 @@ from tensorflow import keras
 from numpy.random import seed
 from tensorflow.random import set_seed
 import tensorflow as tf
-from tensorflow.keras.applications import resnet, resnet50, inception_v3
+# from tensorflow.keras.applications import resnet, resnet50, inception_v3
 
-resnet152 = resnet.ResNet152(
-    include_top=False,
-    weights='imagenet',
-    pooling='avg',
-)
-resnet50 = resnet50.ResNet50(
-    include_top=False,
-    weights='imagenet',
-    pooling='avg',
-)
-inceptionv3 = inception_v3.InceptionV3(include_top=True,
-                                       weights='imagenet',
-                                       pooling='avg',)
+# resnet152 = resnet.ResNet152(
+#     include_top=False,
+#     weights='imagenet',
+#     pooling='avg',
+# )
+# resnet50 = resnet50.ResNet50(
+#     include_top=False,
+#     weights='imagenet',
+#     pooling='avg',
+# )
+# inceptionv3 = inception_v3.InceptionV3(include_top=True,
+#                                        weights='imagenet',
+#                                        pooling='avg',)
 
 
 def cnn_layers(n_timesteps, n_features, kernel_size=4):
@@ -340,7 +340,7 @@ def build_multitask_rnn2(inp_seq_len, inp_features, **kwargs):
 def build_multitask_rnn(inp_seq_len, inp_features, **kwargs):
     """
     There are two outputs - 
-    (1) to predict the item category or the next item and 
+    (1) to predict the item category of the next item and 
     (2) to predict the binary compatibility class 
     """
     num_classes = kwargs.get("num_classes", 2)
@@ -429,6 +429,78 @@ def normalize(x):
     return x_
 
 
+def build_triplet_loss_model(image_features, text_features, **kwargs):
+    num_layers = kwargs.get("num_layers", 2)
+    d_model = kwargs.get("d_model", 128)
+    seed_value = kwargs.get("seed", 100)
+    rate = kwargs.get("rate", 0.1)
+    image_embedding = kwargs.get("image_embedding", "resnet50")
+    model_name = kwargs.get("model_name", "fc")
+    first_activation = kwargs.get("first_activation", "tanh")
+    merge_activation = kwargs.get("merge_activation", "relu")
+    final_activation = kwargs.get("final_activation", None)
+    include_text = kwargs.get("include_text", False)
+    text_feature_dim = kwargs.get("text_feature_dim", 768)
+    margin = kwargs.get("margin", 0.2)
+
+    seed(seed_value)
+    set_seed(seed_value)
+
+    inp_seq_len = 3
+    inputs, flat = [], []
+
+    if type(image_features) is tuple:
+        if image_embedding == "resnet50":
+            image_embedder = tf.keras.layers.TimeDistributed(resnet50)
+        elif image_embedding == "inceptionv3":
+            image_embedder = tf.keras.layers.TimeDistributed(inceptionv3)
+        # tf.keras.models.Sequential(
+        #         [
+        #             tf.keras.layers.Dense(num_classes2, activation="softmax"),
+        #         ]
+        #     )
+    else:
+        unit_embedder = Dense(d_model, activation=first_activation)
+        image_embedder = tf.keras.layers.TimeDistributed(unit_embedder)
+
+    if type(image_features) is tuple:
+        in1 = Input(
+            shape=(
+                inp_seq_len,
+                image_features[0],
+                image_features[1],
+                image_features[2],
+            )
+        )
+    else:
+        in1 = Input(shape=(inp_seq_len, image_features))
+    image_embedded = image_embedder(in1)
+    image_embedded = BatchNormalization()(image_embedded)
+    inputs.append(in1)
+    flat.append(image_embedded)
+
+    in2 = Input(shape=(inp_seq_len, text_features))
+    text_embedder = tf.keras.layers.TimeDistributed(
+        Dense(d_model, activation=first_activation))
+    text_embedded = text_embedder(in2)
+    inputs.append(in2)
+    text_embedded = BatchNormalization()(text_embedded)
+    flat.append(text_embedded)
+    if len(flat) > 1:
+        merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
+    else:
+        merge = flat[0]
+
+    dij = euclidean_distance(
+        [merge[:, 0, :], merge[:, 1, :]])
+    dik = euclidean_distance(
+        [merge[:, 0, :], merge[:, 2, :]])
+    loss = tf.math.maximum(dij - dik + margin, 0)
+
+    model = Model(inputs=inputs, outputs=loss, name=model_name)
+    return model
+
+
 def build_fc_model(inp_seq_len, inp_features, **kwargs):
     """
     Fully connected model with fixed number of inputs
@@ -496,7 +568,6 @@ def build_fc_model(inp_seq_len, inp_features, **kwargs):
 
     model = Model(inputs=inputs, outputs=dense1, name=model_name)
     return model
-
 
 
 class MultiTaskRNN(tf.keras.Model):

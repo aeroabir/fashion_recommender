@@ -1,5 +1,6 @@
 # import effnetv2_model
 import glob
+from itertools import combinations
 import json
 import matplotlib.pyplot as plt
 import os
@@ -10,7 +11,7 @@ import pickle
 import math
 import numpy as np
 import sys
-from transformers import BertTokenizer, BertModel
+# from transformers import BertTokenizer, BertModel
 
 # import torch
 
@@ -49,6 +50,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
         number_negative_samples=0,
         number_items_in_batch=None,
         variable_length_input=True,
+        text_embedding_dim=768,
         label_dict=None,
         shuffle=True,
     ):
@@ -68,7 +70,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.image_dir = image_dir
         self.get_image_embedding = image_embedding
         self.image_embedding_dim = image_embedding_dim
-        self.text_embedding_dim = 768
+        self.text_embedding_dim = text_embedding_dim
         self.image_embedding_file = image_embedding_file
         self.return_item_categories = return_item_categories
         self.return_negative_samples = return_negative_samples
@@ -338,6 +340,140 @@ class CustomDataGen(tf.keras.utils.Sequence):
         # return self.n // self.batch_size
 
 
+class TripletGen(tf.keras.utils.Sequence):
+    """
+    Generates a set of (anchor, positive, negative) items
+    for training under triplet loss. 
+    """
+
+    def __init__(
+        self,
+        positive_samples,
+        item_description,
+        **kwargs,
+    ):
+        self.batch_size = kwargs.get("batch_size", 32)
+        self.shuffle = kwargs.get("shuffle", True)
+        self.get_image_embedding = kwargs.get("get_image_embedding", True)
+        self.image_embedding_file = kwargs.get("image_embedding_file", None)
+        self.text_embedding_file = kwargs.get("text_embedding_file", None)
+        self.max_example = kwargs.get("max_example", 100000)
+        self.item_description = item_description
+        # build item->category dict
+        # collect all items by categories
+        self.items_by_category, self.item2cat = {}, {}
+        for item, desc in self.item_description.items():
+            cat = desc["category_id"]
+            self.item2cat[item] = cat
+            if cat in self.items_by_category:
+                self.items_by_category[cat].append(item)
+            else:
+                self.items_by_category[cat] = [item]
+
+        # create all the training data
+        X, y = [], []
+        for outfit in positive_samples:
+            items = [o['item_id'] for o in outfit['items']]
+            # combs = combinations(items, 2)  # too many items
+            combs = [(items[ii], items[ii+1]) for ii in range(len(items)-1)]
+            for itempair in combs:
+                anchor = itempair[0]
+                pos = itempair[1]
+                neg = self.get_negative_samples(pos)[0]
+                X.append([anchor, pos, neg])
+                y.append(0)
+            if self.max_example and len(y) > self.max_example:
+                break
+        self.df = pd.DataFrame({"X": X, "y": y})
+        self.X_col = "X"
+        self.y_col = "y"
+        self.n = len(self.df)
+        print(f"Total {self.n} examples")
+
+        if self.get_image_embedding:
+            # "effnet2_polyvore.pkl" - 1280 dimensional vector
+            # "effnet_tuned_polyvore.pkl" - 1280 dimensional vector
+            # "graphsage_dict_polyvore.pkl" - 50 dimension
+            # "graphsage_dict2_polyvore.pkl" - 50 dimension
+            with open(self.image_embedding_file, "rb") as fr:
+                self.embedding_dict = pickle.load(fr)
+
+        # "bert_polyvore.pkl" - 768 dimensional vector
+        with open(self.text_embedding_file, "rb") as fr:
+            self.text_embedding_dict = pickle.load(fr)
+
+        # original data has all positives followed by all negatives
+        self.on_epoch_end()
+
+    def get_negative_samples(self, item_id, num_negative=1):
+        # for a given item get another item from the same category
+        item_cat = self.item2cat[item_id]
+        item_pool = self.items_by_category[item_cat].copy()
+        try:
+            item_pool.remove(item_id)
+        except:
+            print("cannot find!!")
+            print(item_id, item_cat)
+            print(item_pool)
+        neg_items = np.random.randint(
+            low=0, high=len(item_pool), size=num_negative)
+        neg_items = [item_pool[ii] for ii in neg_items]
+        return neg_items
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+    def get_image(self, item_id):
+        if self.get_image_embedding:
+            return self.embedding_dict[item_id]
+        image_path = os.path.join(self.image_dir, item_id + ".jpg")
+        image = tf.keras.preprocessing.image.load_img(image_path)
+        image_arr = tf.keras.preprocessing.image.img_to_array(image)
+        image_arr = tf.image.resize(
+            image_arr, (self.input_size[0], self.input_size[1])
+        ).numpy()
+        image_arr /= 255.0
+        # if self.get_image_embedding:
+        # return tf.squeeze(self.model(tf.expand_dims(image_arr, 0)))
+        return image_arr
+
+    def get_texts(self, item_id):
+        return self.text_embedding_dict[item_id]
+
+    def __get_input(self, example):
+        text_data, image_data = [], []
+        for item in example:
+            image = self.get_image(item)
+            text = self.get_texts(item)
+            image_data.append(image)
+            text_data.append(text)
+
+        return image_data, text_data
+
+    def __get_data(self, batches):
+        # Generates data containing batch_size samples
+        x_batch = batches["X"].tolist()
+        y_batch = batches["y"].tolist()
+        combined = [self.__get_input(x) for x in x_batch]
+        X_batch = (
+            np.asarray([x[0] for x in combined]),
+            np.asarray([x[1] for x in combined]),
+        )
+
+        y_batch = np.asarray([int(y) for y in y_batch])
+        return X_batch, y_batch
+
+    def __getitem__(self, index):
+        batches = self.df[index *
+                          self.batch_size: (index + 1) * self.batch_size]
+        X, y = self.__get_data(batches)
+        return X, y
+
+    def __len__(self):
+        return math.ceil(self.n / self.batch_size)
+
+
 class ImageDataGen(tf.keras.utils.Sequence):
     def __init__(
         self,
@@ -433,6 +569,13 @@ class ImageDataGen(tf.keras.utils.Sequence):
 
 
 class OutfitGen(tf.keras.utils.Sequence):
+    """
+    This generator creates sample outfits using a query item (list)
+    and adding one item at a time from a list of common items. The 
+    outfit thus created is evaluated by an existing model and the 
+    outfit score is utilized further for creating the best outfit.
+    """
+
     def __init__(
         self,
         embed_dir,
