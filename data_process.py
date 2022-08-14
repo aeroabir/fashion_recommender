@@ -11,6 +11,7 @@ import pickle
 import math
 import numpy as np
 import sys
+from tqdm import tqdm
 # from transformers import BertTokenizer, BertModel
 
 # import torch
@@ -340,10 +341,212 @@ class CustomDataGen(tf.keras.utils.Sequence):
         # return self.n // self.batch_size
 
 
+class CSANetGen(tf.keras.utils.Sequence):
+    """
+    Generates triplets according to CSA-Net model
+    1. an outfit with N items
+    2. a positive (image, category) that can go well with the outfit
+    3. a set of negative (image, category) that will not go well with the outfit
+
+    For each outfit, we follow these steps:
+    1> take the first item as the positive image
+    2> take the rest of the items as an outfit
+    3> for each item in the outfit sample an image from the same category - 
+        this constitutes the negative set
+    """
+
+    def __init__(
+        self,
+        positive_samples,
+        item_description,
+        **kwargs,
+    ):
+        self.batch_size = kwargs.get("batch_size", 32)
+        self.shuffle = kwargs.get("shuffle", True)
+        self.get_image_embedding = kwargs.get("get_image_embedding", True)
+        self.image_embedding_file = kwargs.get("image_embedding_file", None)
+        self.text_embedding_file = kwargs.get("text_embedding_file", None)
+        self.max_example = kwargs.get("max_example", 100000)
+        self.item_description = item_description
+        self.image_embedding_dim = kwargs.get("image_embedding_dim", 1280)
+        self.input_size = kwargs.get("input_size", (224, 224, 3))
+        self.max_len = kwargs.get("max_items", 8)
+        self.image_dir = kwargs.get("image_dir", None)
+        self.mask_zero = kwargs.get("mask_zero", True)
+
+        # build item->category dict
+        # collect all items by categories
+        self.items_by_category, self.item2cat = {}, {}
+        self.category2id = {}
+        if self.mask_zero:
+            category_count = 1
+            self.category_zero = 0
+        else:
+            category_count = 0
+            self.category_zero = -1
+
+        for item, desc in self.item_description.items():
+            cat = desc["category_id"]
+
+            # create a dict of category numbers
+            if cat not in self.category2id:
+                self.category2id[cat] = category_count
+                category_count += 1
+
+            self.item2cat[item] = cat
+            if cat in self.items_by_category:
+                self.items_by_category[cat].append(item)
+            else:
+                self.items_by_category[cat] = [item]
+        print(f"Total {category_count} item categories")
+        # print(self.category2id)
+
+        if self.get_image_embedding:
+            self.zero_elem_image = np.zeros(
+                self.image_embedding_dim)  # np.zeros((1, 1280))
+        else:
+            self.zero_elem_image = np.zeros(self.input_size)
+
+        # create all the training data
+        X, y = [], []
+        Z = []
+        for outfit in tqdm(positive_samples):
+            items = [o['item_id'] for o in outfit['items']]
+            pos_item = items[0]
+            outfit_i = items[1:]
+            neg_set, neg_cat, outfit_cat = [], [], []
+            for item in outfit_i:
+                neg = self.get_negative_samples(item)[0]
+                neg_set.append(neg)
+                outfit_cat.append(self.category2id[self.item2cat[item]])
+                neg_cat.append(self.category2id[self.item2cat[neg]])
+            X.append([outfit_i, pos_item, neg_set])
+            y.append(0)
+            Z.append(
+                [outfit_cat, self.category2id[self.item2cat[pos_item]], neg_cat])
+            if self.max_example and len(y) > self.max_example:
+                break
+        self.df = pd.DataFrame({"X": X, "y": y, "Z": Z})
+        self.X_col = "X"
+        self.y_col = "y"
+        self.z_col = "Z"
+        self.n = len(self.df)
+        print(f"Total {self.n} examples")
+
+        if self.get_image_embedding:
+            # "effnet2_polyvore.pkl" - 1280 dimensional vector
+            # "effnet_tuned_polyvore.pkl" - 1280 dimensional vector
+            # "graphsage_dict_polyvore.pkl" - 50 dimension
+            # "graphsage_dict2_polyvore.pkl" - 50 dimension
+            with open(self.image_embedding_file, "rb") as fr:
+                self.embedding_dict = pickle.load(fr)
+
+        # "bert_polyvore.pkl" - 768 dimensional vector
+        with open(self.text_embedding_file, "rb") as fr:
+            self.text_embedding_dict = pickle.load(fr)
+
+        # original data has all positives followed by all negatives
+        self.on_epoch_end()
+
+    def get_negative_samples(self, item_id, num_negative=1):
+        # for a given item get another item from the same category
+        item_cat = self.item2cat[item_id]
+        item_pool = self.items_by_category[item_cat].copy()
+        try:
+            item_pool.remove(item_id)
+        except:
+            print("cannot find!!")
+            print(item_id, item_cat)
+            print(item_pool)
+        neg_items = np.random.randint(
+            low=0, high=len(item_pool), size=num_negative)
+        neg_items = [item_pool[ii] for ii in neg_items]
+        return neg_items
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+    def get_image(self, item_id):
+        if self.get_image_embedding:
+            return self.embedding_dict[item_id]
+        image_path = os.path.join(self.image_dir, item_id + ".jpg")
+        image = tf.keras.preprocessing.image.load_img(image_path)
+        image_arr = tf.keras.preprocessing.image.img_to_array(image)
+        image_arr = tf.image.resize(
+            image_arr, (self.input_size[0], self.input_size[1])
+        ).numpy()
+        image_arr /= 255.0
+        # if self.get_image_embedding:
+        # return tf.squeeze(self.model(tf.expand_dims(image_arr, 0)))
+        return image_arr
+
+    def get_texts(self, item_id):
+        return self.text_embedding_dict[item_id]
+
+    def __get_input(self, example, example_cat):
+        outfit = example[0][:self.max_len]
+        positive = example[1]
+        negatives = example[2][:self.max_len]
+
+        outfit_cat = example_cat[0][:self.max_len]
+        positive_cat = example_cat[1]
+        negatives_cat = example_cat[2][:self.max_len]
+
+        outfit_data, negative_data = [], []
+        for ii, jj in zip(outfit, negatives):
+            outfit_data.append(self.get_image(ii))
+            negative_data.append(self.get_image(jj))
+        pos_data = self.get_image(positive)
+
+        if len(outfit) < self.max_len:
+            padding = [self.zero_elem_image for _ in range(
+                self.max_len - len(outfit))]
+            outfit_data = padding + outfit_data
+            negative_data = padding + negative_data
+
+            padding_2 = [self.category_zero] * (self.max_len - len(outfit))
+            outfit_cat = padding_2 + outfit_cat
+            negatives_cat = padding_2 + negatives_cat
+
+        return outfit_data, pos_data, negative_data, outfit_cat, positive_cat, negatives_cat
+
+    def __get_data(self, batches):
+        # Generates data containing batch_size samples
+        x_batch = batches["X"].tolist()
+        y_batch = batches["y"].tolist()
+        z_batch = batches["Z"].tolist()
+        combined = [self.__get_input(x, z) for x, z in zip(x_batch, z_batch)]
+        X_batch = (
+            np.asarray([x[0] for x in combined]),
+            np.asarray([x[1] for x in combined]),
+            np.asarray([x[2] for x in combined]),
+            np.asarray([x[3] for x in combined]),
+            np.asarray([x[4] for x in combined]),
+            np.asarray([x[5] for x in combined]),
+        )
+
+        y_batch = np.asarray([int(y) for y in y_batch])
+        return X_batch, y_batch
+
+    def __getitem__(self, index):
+        batches = self.df[index *
+                          self.batch_size: (index + 1) * self.batch_size]
+        X, y = self.__get_data(batches)
+        return X, y
+
+    def __len__(self):
+        return math.ceil(self.n / self.batch_size)
+
+
 class TripletGen(tf.keras.utils.Sequence):
     """
     Generates a set of (anchor, positive, negative) items
-    for training under triplet loss. 
+    for training under triplet loss.
+
+    Ref: Mariya I. Vasileva, Bryan A. Plummer, Krishna Dusad, Shreya Rajpal, 
+    Ranjitha Kumar, and David Forsyth. Learning type-aware embeddings for 
+    fashion copatibility. In ECCV, 2018. 
     """
 
     def __init__(
