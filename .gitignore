@@ -6,6 +6,8 @@ polyvore-dataset/
 *.tgz
 *.pkl
 *.pickle
+*.png
+*.h5
 /wandb/
 /finetuned_efficientnet/
 /logs/

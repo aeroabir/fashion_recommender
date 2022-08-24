@@ -1,3 +1,4 @@
+from email.mime import image
 from tensorflow.keras.layers import (
     Conv1D,
     Input,
@@ -21,21 +22,115 @@ from tensorflow import keras
 from numpy.random import seed
 from tensorflow.random import set_seed
 import tensorflow as tf
-# from tensorflow.keras.applications import resnet, resnet50, inception_v3
+from tensorflow.keras.applications import resnet, resnet50, inception_v3
+from transformer_models_ts import Encoder
+from vgg16_models import vgg16_model, vgg16_model_small, vgg16_model_smaller
 
 # resnet152 = resnet.ResNet152(
 #     include_top=False,
 #     weights='imagenet',
 #     pooling='avg',
 # )
-# resnet50 = resnet50.ResNet50(
-#     include_top=False,
-#     weights='imagenet',
-#     pooling='avg',
-# )
-# inceptionv3 = inception_v3.InceptionV3(include_top=True,
-#                                        weights='imagenet',
-#                                        pooling='avg',)
+
+
+def scaled_dot_product_attention(q, k, v, mask):
+    """Calculate the attention weights.
+    q, k, v must have matching leading dimensions.
+    k, v must have matching penultimate dimension, i.e.: seq_len_k = seq_len_v.
+    The mask has different shapes depending on its type(padding or look ahead)
+    but it must be broadcastable for addition.
+
+    Args:
+    q: query shape == (..., seq_len_q, depth)
+    k: key shape == (..., seq_len_k, depth)
+    v: value shape == (..., seq_len_v, depth_v)
+    mask: Float tensor with shape broadcastable
+          to (..., seq_len_q, seq_len_k). Defaults to None.
+
+    Returns:
+    output, attention_weights
+    """
+
+    # (..., seq_len_q, seq_len_k)
+    matmul_qk = tf.matmul(q, k, transpose_b=True)
+
+    # scale matmul_qk
+    dk = tf.cast(tf.shape(k)[-1], tf.float32)
+    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+
+    # print(scaled_attention_logits.shape, mask.shape)
+
+    # add the mask to the scaled tensor.
+    if mask is not None:
+        scaled_attention_logits += mask * -1e9
+
+    # softmax is normalized on the last axis (seq_len_k) so that the scores
+    # add up to 1.
+    attention_weights = tf.nn.softmax(
+        scaled_attention_logits, axis=-1
+    )  # (..., seq_len_q, seq_len_k)
+
+    output = tf.matmul(attention_weights, v)  # (..., seq_len_q, depth_v)
+
+    return output, attention_weights
+
+
+class MultiHeadAttention(tf.keras.layers.Layer):
+    def __init__(self, seq_len, d_model, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.seq_len = seq_len
+
+        assert d_model % self.num_heads == 0
+
+        self.depth = d_model // self.num_heads
+
+        self.wq = tf.keras.layers.Dense(d_model)
+        self.wk = tf.keras.layers.Dense(d_model)
+        self.wv = tf.keras.layers.Dense(d_model)
+
+        self.dense = tf.keras.layers.Dense(d_model)
+
+    def split_heads(self, x):
+        """Split the last dimension into (num_heads, depth).
+        Transpose the result such that the shape is (batch_size, num_heads, seq_len, depth)
+        """
+        x = tf.reshape(x, (-1, self.seq_len, self.num_heads, self.depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])
+
+    def call(self, v, k, q, mask):
+        # batch_size = tf.shape(q)[0]
+
+        q = self.wq(q)  # (batch_size, seq_len, d_model)
+        k = self.wk(k)  # (batch_size, seq_len, d_model)
+        v = self.wv(v)  # (batch_size, seq_len, d_model)
+
+        # (batch_size, num_heads, seq_len_q, depth)
+        q = self.split_heads(q)
+        # (batch_size, num_heads, seq_len_k, depth)
+        k = self.split_heads(k)
+        # (batch_size, num_heads, seq_len_v, depth)
+        v = self.split_heads(v)
+
+        # scaled_attention.shape == (batch_size, num_heads, seq_len_q, depth)
+        # attention_weights.shape == (batch_size, num_heads, seq_len_q, seq_len_k)
+        scaled_attention, attention_weights = scaled_dot_product_attention(
+            q, k, v, mask
+        )
+
+        scaled_attention = tf.transpose(
+            scaled_attention, perm=[0, 2, 1, 3]
+        )  # (batch_size, seq_len_q, num_heads, depth)
+
+        concat_attention = tf.reshape(
+            scaled_attention, (-1, self.seq_len, self.d_model)
+        )  # (batch_size, seq_len_q, d_model)
+
+        # (batch_size, seq_len_q, d_model)
+        output = self.dense(concat_attention)
+
+        return output, attention_weights
 
 
 def cnn_layers(n_timesteps, n_features, kernel_size=4):
@@ -62,7 +157,7 @@ def cnn_layers(n_timesteps, n_features, kernel_size=4):
     return in1, flat1
 
 
-def rnn_layer(layer, n_timesteps, n_features, num_layers, d_model, return_seq=True):
+def create_input(n_timesteps, n_features):
     if type(n_features) is tuple:
         in1 = Input(
             shape=(
@@ -72,7 +167,43 @@ def rnn_layer(layer, n_timesteps, n_features, num_layers, d_model, return_seq=Tr
                 n_features[2],
             )
         )
-        embedded = tf.keras.layers.TimeDistributed(resnet50)(in1)
+        embedded = tf.keras.layers.TimeDistributed(vgg16)(in1)
+    else:
+        in1 = Input(
+            shape=(
+                n_timesteps,
+                n_features,
+            )
+        )
+    return in1
+
+
+def get_rnn_model(layer, d_model, return_seq=True):
+    if layer == "lstm":
+        encoder = LSTM(units=d_model, return_sequences=return_seq)
+    elif layer == "gru":
+        encoder = GRU(units=d_model, return_sequences=return_seq)
+    elif layer == "bilstm":
+        base_rnn = LSTM(units=d_model, return_sequences=return_seq)
+        encoder = Bidirectional(base_rnn, merge_mode="concat")
+    elif layer == "bigru":
+        base_rnn = GRU(units=d_model, return_sequences=return_seq)
+        encoder = Bidirectional(base_rnn, merge_mode="concat")
+    return encoder
+
+
+def rnn_layer(layer, n_timesteps, n_features, num_layers, d_model, image_encoder=None, return_seq=True):
+    if type(n_features) is tuple:
+        in1 = Input(
+            shape=(
+                n_timesteps,
+                n_features[0],
+                n_features[1],
+                n_features[2],
+            )
+        )
+        assert image_encoder is not None, "image encoder not found !!"
+        embedded = tf.keras.layers.TimeDistributed(image_encoder)(in1)
     else:
         in1 = Input(
             shape=(
@@ -106,22 +237,13 @@ def rnn_layer(layer, n_timesteps, n_features, num_layers, d_model, return_seq=Tr
     # mask = tf.keras.layers.Masking(mask_value=0.,
     #                               input_shape=(n_timesteps, 2048))
     # mask = None
-    if layer == "lstm":
-        encoder = LSTM(units=d_model, return_sequences=return_seq)
-    elif layer == "gru":
-        encoder = GRU(units=d_model, return_sequences=return_seq)
-    elif layer == "bilstm":
-        base_rnn = LSTM(units=d_model, return_sequences=return_seq)
-        encoder = Bidirectional(base_rnn, merge_mode="concat")
-    elif layer == "bigru":
-        base_rnn = GRU(units=d_model, return_sequences=return_seq)
-        encoder = Bidirectional(base_rnn, merge_mode="concat")
-
+    encoder = get_rnn(layer, d_model, return_seq=return_seq)
     encoded = encoder(c1, mask=mask)
     if num_layers > 1:
         encoders = [encoder]
+
     for _ in range(1, num_layers):
-        encoder = LSTM(units=d_model, return_sequences=return_seq)
+        encoder = get_rnn(layer, d_model, return_seq=return_seq)
         encoded = encoder(encoded, mask=mask)
         encoders.append(encoder)
     return in1, encoded
@@ -141,7 +263,7 @@ def get_rnn(layer, d_model, return_seq=True):
     return encoder
 
 
-def build_multilevel_rnn_unequal(inp_seq_len, inp_features, **kwargs):
+def build_hybrid_model(inp_seq_len, inp_features, **kwargs):
     """
     input sequence length does not have to be same as the target
     sequence length; required for short term forecasting where
@@ -154,34 +276,191 @@ def build_multilevel_rnn_unequal(inp_seq_len, inp_features, **kwargs):
     d_model = kwargs.get("d_model", 128)
     seed_value = kwargs.get("seed", 100)
     rate = kwargs.get("rate", 0.1)
-    model_name = kwargs.get("model_name", "rnn")
+    embedding_activation = kwargs.get("embedding_activation", "linear")
     final_activation = kwargs.get("final_activation", None)
     include_text = kwargs.get("include_text", False)
     text_feature_dim = kwargs.get("text_feature_dim", 768)
+    include_item_categories = kwargs.get("include_item_categories", False)
+    num_categories = kwargs.get("num_categories", 153)
+    mask_zero = kwargs.get("mask_zero", True)
+    num_heads = kwargs.get("num_heads", 8)
+    dff = kwargs.get("dff", 128)
+    model_name = kwargs.get("model_name", "hybrid")
 
     seed(seed_value)
     set_seed(seed_value)
 
     inputs, flat = [], []
     # for image
-    t_in1, t_flat1 = rnn_layer(
-        rnn, inp_seq_len, inp_features, num_layers, d_model, rate
-    )
+    t_in1 = create_input(inp_seq_len, inp_features)
+    o1 = Dense(d_model, activation=embedding_activation)(t_in1)
     inputs.append(t_in1)
-    flat.append(t_flat1)
+    flat.append(o1)
 
     if include_text:
-        t_in2, t_flat2 = rnn_layer(
-            rnn, inp_seq_len, text_feature_dim, num_layers, d_model, rate
-        )
+        t_in2 = create_input(inp_seq_len, text_feature_dim)
+        o2 = Dense(d_model, activation=embedding_activation)(t_in2)
         inputs.append(t_in2)
-        flat.append(t_flat2)
+        flat.append(o2)
+
+    if include_item_categories:
+        in3 = Input(shape=(inp_seq_len,))  # (?, 8)
+        category_embedder = tf.keras.layers.Embedding(
+            input_dim=num_categories,
+            output_dim=d_model,
+            embeddings_initializer="uniform",
+            mask_zero=mask_zero,
+        )
+        category_embedded = category_embedder(in3)
+        inputs.append(in3)
+        flat.append(category_embedded)
 
     components = len(flat)
     if components > 1:
         merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
     else:
         merge = flat[0]
+
+    transformer_encoder = Encoder(
+        num_layers, d_model, num_heads, dff, inp_seq_len, rate, embedding_activation
+    )
+    merge = transformer_encoder(merge, True)
+    merge = BatchNormalization()(merge)
+
+    rnn_encoder = get_rnn_model(rnn, d_model, return_seq=True)
+    mask = tf.math.not_equal(in3, 0)
+    merge = rnn_encoder(merge, mask=mask)
+
+    # convert to the target_sequence_length
+    merge = Permute((2, 1), input_shape=(
+        inp_seq_len, d_model))(merge)
+    merge = Dense(1, activation="relu")(merge)
+    merge = tf.squeeze(merge, axis=-1)
+    merge = tf.keras.layers.Dropout(rate)(merge)
+
+    if num_classes == 2:
+        dense1 = Dense(1, activation=final_activation)(merge)
+    else:
+        dense1 = Dense(num_classes, activation="softmax")(merge)
+
+    model = Model(inputs=inputs, outputs=dense1, name=model_name)
+    return model
+
+
+def build_multilevel_rnn_unequal(inp_seq_len, **kwargs):
+    """
+    input sequence length does not have to be same as the target
+    sequence length; required for short term forecasting where
+    window length is greater than the forecast horizon
+
+    """
+    num_classes = kwargs.get("num_classes", 2)
+    rnn = kwargs.get("rnn", "lstm")
+    num_layers = kwargs.get("num_layers", 2)
+    d_model = kwargs.get("d_model", 128)
+    num_heads = kwargs.get("num_heads", 2)
+    seed_value = kwargs.get("seed", 100)
+    rate = kwargs.get("rate", 0.1)
+    model_name = kwargs.get("model_name", "rnn")
+    final_activation = kwargs.get("final_activation", None)
+    include_text = kwargs.get("include_text", False)
+    image_embedding_dim = kwargs.get("image_embedding_dim", 1280)
+    text_feature_dim = kwargs.get("text_feature_dim", 768)
+    include_item_categories = kwargs.get("include_item_categories", False)
+    image_data_type = kwargs.get("image_data_type", "embedding")
+    include_multihead_attention = kwargs.get(
+        "include_multihead_attention", False)
+    original_image_dim = kwargs.get("original_image_dim", (224, 224, 3))
+    num_categories = kwargs.get("num_categories", 153)
+    mask_zero = kwargs.get("mask_zero", True)
+    image_encoder = kwargs.get("image_encoder", "resnet50")
+
+    seed(seed_value)
+    set_seed(seed_value)
+
+    if image_data_type == "original":
+        inp_features = original_image_dim
+    elif image_data_type == "embedding":
+        inp_features = image_embedding_dim
+    elif image_data_type == "both":
+        inp_features = image_embedding_dim
+
+    if image_data_type in ["original", "both"]:
+        if image_encoder == "resnet50":
+            i_encoder = resnet50.ResNet50(
+                include_top=False,
+                weights='imagenet',
+                pooling='avg',
+            )
+        elif image_encoder == "inception":
+            i_encoder = inception_v3.InceptionV3(include_top=True,
+                                                 weights='imagenet',
+                                                 pooling='avg',)
+        elif image_encoder == "vgg16":
+            i_encoder = tf.keras.applications.vgg16.VGG16(
+                include_top=False, weights='imagenet', pooling='avg',)
+            # vgg16 = vgg16_model('avg')
+            # vgg16 = vgg16_model_small('avg')
+            # vgg16 = vgg16_model_smaller('avg')
+    else:
+        i_encoder = None
+
+    # embedding or image
+    inputs, flat = [], []
+    # for image
+    t_in1, t_flat1 = rnn_layer(
+        rnn, inp_seq_len, inp_features, num_layers, d_model, i_encoder,
+    )
+    inputs.append(t_in1)
+    flat.append(t_flat1)
+
+    if image_data_type == "both":
+        t_ino, t_flato = rnn_layer(
+            rnn, inp_seq_len, original_image_dim, num_layers, d_model, i_encoder,
+        )
+        inputs.append(t_ino)
+        flat.append(t_flato)
+
+    if include_text:
+        t_in2, t_flat2 = rnn_layer(
+            rnn, inp_seq_len, text_feature_dim, num_layers, d_model, i_encoder,
+        )
+        inputs.append(t_in2)
+        flat.append(t_flat2)
+
+    if include_item_categories:
+        in3 = Input(shape=(inp_seq_len,))  # (?, 8)
+        # category_embedder = tf.keras.models.Sequential()
+        first_embedder = tf.keras.layers.Embedding(
+            input_dim=num_categories,
+            output_dim=d_model,
+            embeddings_initializer="uniform",
+            mask_zero=mask_zero,
+        )
+        # category_embedder.add(first_embedder)
+        rnn_encoder = get_rnn(rnn, d_model, return_seq=True)
+        # category_embedder.add(rnn_encoder)
+        category_embedded = first_embedder(in3)
+        category_embedded = rnn_encoder(category_embedded)
+        inputs.append(in3)
+        flat.append(category_embedded)
+
+    if include_multihead_attention:
+        mha = MultiHeadAttention(inp_seq_len, d_model, num_heads)
+        # inputs are (V, K, Q)
+        # v1, _ = mha(flat[0], flat[1], flat[2], mask=None)
+        # v2, _ = mha(flat[1], flat[0], flat[2], mask=None)
+        # v3, _ = mha(flat[2], flat[0], flat[1], mask=None)
+        # flat = [v1, v2, v3]
+
+    components = len(flat)
+    if components > 1:
+        merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
+    else:
+        merge = flat[0]
+
+    if include_multihead_attention:
+        merge, _ = mha(merge, merge, merge, mask=None)
     merge = BatchNormalization()(merge)
 
     # convert to the target_sequence_length
@@ -491,6 +770,7 @@ def build_triplet_loss_model(image_features, text_features, **kwargs):
     else:
         merge = flat[0]
 
+    # i-anchor item, j-positive item, k-negative item
     dij = euclidean_distance(
         [merge[:, 0, :], merge[:, 1, :]])
     dik = euclidean_distance(
@@ -519,8 +799,9 @@ def build_fc_model(inp_seq_len, inp_features, **kwargs):
     final_activation = kwargs.get("final_activation", None)
     include_text = kwargs.get("include_text", False)
     text_feature_dim = kwargs.get("text_feature_dim", 768)
-    model_name1 = kwargs.get("model_name1", "item_classification")
-    model_name2 = kwargs.get("model_name2", "compatibility")
+    include_item_categories = kwargs.get("include_item_categories", False)
+    num_categories = kwargs.get("num_categories", 153)
+    mask_zero = kwargs.get("mask_zero", True)
 
     seed(seed_value)
     set_seed(seed_value)
@@ -554,6 +835,18 @@ def build_fc_model(inp_seq_len, inp_features, **kwargs):
         inputs.append(in2)
         text_embedded = BatchNormalization()(text_embedded)
         flat.append(text_embedded)
+
+    if include_item_categories:
+        in3 = Input(shape=(inp_seq_len,))  # (?, 8)
+        category_embedder = tf.keras.layers.Embedding(
+            input_dim=num_categories,
+            output_dim=d_model,
+            embeddings_initializer="uniform",
+            mask_zero=mask_zero,
+        )
+        category_embedded = category_embedder(in3)
+        inputs.append(in3)
+        flat.append(category_embedded)
 
     if len(flat) > 1:
         merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)

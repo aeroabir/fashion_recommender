@@ -1,3 +1,4 @@
+from turtle import dot
 import tensorflow as tf
 from tensorflow.keras.applications import InceptionV3, ResNet50
 # from tensorflow.keras.applications import resnet
@@ -13,7 +14,10 @@ from tensorflow.keras.layers import (
     Dense,
     RepeatVector,
     GlobalAveragePooling2D,
-    Add
+    Add,
+    LSTM,
+    GRU,
+    Bidirectional,
 )
 from tensorflow.keras.models import Model
 
@@ -38,6 +42,7 @@ def euclidean_distance(vects):
 class SubspaceAttn(tf.keras.Model):
     """
     Computes subspace attention between two categories
+    Inputs are (1) image, (2) corresponding category and (3) another category
     """
 
     def __init__(self, **kwargs):
@@ -82,9 +87,9 @@ class SubspaceAttn(tf.keras.Model):
         return f
 
 
-def build_csenet(inp_seq_len, image_dim, **kwargs):
+def build_csanet(inp_seq_len, image_dim, **kwargs):
     """
-    CSE-Net triplet processing model using pretrained keras models
+    CSA-Net triplet processing model using pretrained keras models
     """
     model_name = kwargs.get("model_name", "cse-net")
     image_embedding_dim = kwargs.get("image_embedding_dim", 64)
@@ -180,6 +185,149 @@ def build_csenet(inp_seq_len, image_dim, **kwargs):
 
     model = Model(inputs=all_inputs, outputs=loss, name=model_name)
     return model
+
+
+def build_csanet2(inp_seq_len, image_dim, **kwargs):
+    """
+    CSA-Net-II triplet processing model using pretrained keras models
+    Inputs: 
+        1) an outfit of fixed length (images and categories)
+        2) an item image and category
+        3) a third item (negative) if modeling with triplet loss
+    """
+    model_name = kwargs.get("model_name", "CSA-net-II")
+    image_embedding_dim = kwargs.get("image_embedding_dim", 64)
+    category_embedding_dim = kwargs.get("category_embedding_dim", 64)
+    loss_type = kwargs.get("loss_type", "triplet")
+    embedding_activation = kwargs.get("embedding_activation", "tanh")
+    final_activation = kwargs.get("final_activation", None)
+    margin = kwargs.get("margin", 0.4)
+    num_categories = kwargs.get("num_categories", 153)
+    num_subspace = kwargs.get("num_subspace", 6)
+    d_model = kwargs.get("d_model", 128)
+    rnn = kwargs.get("rnn", "bilstm")
+
+    # define various encoders
+    outfit_encoder = get_rnn(rnn, d_model, return_seq=True)
+    if rnn == "bilstm":
+        out_dim = 2 * d_model
+    else:
+        out_dim = d_model
+    item_encoder = Dense(out_dim, activation=embedding_activation)
+
+    category_embedder = tf.keras.layers.Embedding(
+        input_dim=num_categories,
+        output_dim=category_embedding_dim,
+        embeddings_initializer="uniform",
+        mask_zero=False,
+    )
+    image_embedder = tf.keras.models.Sequential()
+    if type(image_dim) is tuple:
+        outfit_images = Input(
+            shape=(
+                inp_seq_len,
+                image_dim[0],
+                image_dim[1],
+                image_dim[2],
+            )
+        )
+        positive_image = Input(
+            shape=(
+                image_dim[0],
+                image_dim[1],
+                image_dim[2],
+            )
+        )
+        if "triplet" in loss_type.lower():
+            negative_image = Input(
+                shape=(
+                    image_dim[0],
+                    image_dim[1],
+                    image_dim[2],
+                )
+            )
+        image_embedder.add(ResNet50(
+            include_top=True,
+            weights="imagenet",
+            pooling='avg',
+        ))
+    else:
+        outfit_images = Input(shape=(inp_seq_len, image_dim))
+        positive_image = Input(shape=(image_dim))
+        if "triplet" in loss_type.lower():
+            negative_image = Input(shape=(image_dim))
+
+    all_inputs = [outfit_images, positive_image]
+    if "triplet" in loss_type.lower():
+        all_inputs.append(negative_image)
+
+    image_embedder.add(
+        Dense(image_embedding_dim, activation=embedding_activation))
+
+    outfit_categories = Input(shape=(inp_seq_len))
+    positive_category = Input(shape=())
+    all_inputs += [outfit_categories, positive_category]
+
+    outfit_embedded = tf.keras.layers.TimeDistributed(
+        image_embedder)(outfit_images)
+    positive_embedded = image_embedder(positive_image)
+
+    if "triplet" in loss_type.lower():
+        negative_category = Input(shape=())
+        all_inputs.append(negative_category)
+        negative_embedded = image_embedder(negative_image)
+
+    outfit_cats = category_embedder(outfit_categories)  # (None, s, 32)
+    positive_category = category_embedder(positive_category)  # (None, 32)
+
+    # combine image and category
+    outfit = concatenate([outfit_embedded, outfit_cats], axis=-1)
+    outfit = outfit_encoder(outfit)
+
+    positive = concatenate([positive_embedded, positive_category])
+    positive = item_encoder(positive)
+
+    # get attentional weight
+    # attention = tf.keras.layers.Multiply()(
+    #     [outfit, RepeatVector(inp_seq_len)(positive)])
+    attention = tf.keras.layers.Dot(axes=(2))(
+        [outfit, RepeatVector(inp_seq_len)(positive)])
+    attention = tf.math.reduce_sum(attention, axis=-1)
+    attention = tf.keras.layers.Softmax()(attention)
+
+    # take weighted sum
+    outfit = tf.math.multiply(outfit, tf.expand_dims(attention, axis=-1))
+    outfit = tf.reduce_sum(outfit, axis=-2)
+
+    if "triplet" in loss_type.lower():
+        negative_category = category_embedder(negative_category)  # (None, 32)
+        negative = concatenate([negative_embedded, negative_category])
+        negative = item_encoder(negative)
+        Dp = euclidean_distance([outfit, positive])
+        Dp = tf.math.reduce_sum(Dp, axis=-1)
+        Dn = euclidean_distance([outfit, negative])
+        Dn = tf.math.reduce_sum(Dn, axis=-1)
+        loss = tf.math.maximum(Dp - Dn + margin, 0)
+    else:
+        merge = concatenate([outfit, positive])
+        loss = Dense(1, activation=final_activation)(merge)
+
+    model = Model(inputs=all_inputs, outputs=loss, name=model_name)
+    return model
+
+
+def get_rnn(rnn_name, d_model, return_seq=True):
+    if rnn_name == "lstm":
+        encoder = LSTM(units=d_model, return_sequences=return_seq)
+    elif rnn_name == "gru":
+        encoder = GRU(units=d_model, return_sequences=return_seq)
+    elif rnn_name == "bilstm":
+        base_rnn = LSTM(units=d_model, return_sequences=return_seq)
+        encoder = Bidirectional(base_rnn, merge_mode="concat")
+    elif rnn_name == "bigru":
+        base_rnn = GRU(units=d_model, return_sequences=return_seq)
+        encoder = Bidirectional(base_rnn, merge_mode="concat")
+    return encoder
 
 
 class ResnetBlock(tf.keras.Model):

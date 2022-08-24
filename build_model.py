@@ -97,7 +97,8 @@ class image_embedding_layer(tf.keras.layers.Layer):
         self.layer = tf.keras.Sequential(
             [
                 # tf.keras.layers.Cropping2D(38),
-                effnetv2_model.get_model("efficientnetv2-b0", include_top=False),
+                effnetv2_model.get_model(
+                    "efficientnetv2-b0", include_top=False),
                 tf.keras.layers.Dropout(rate=self.dropout),
                 tf.keras.layers.Dense(self.embedding_dim, activation="tanh"),
             ]
@@ -119,13 +120,16 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     rate = kwargs.get("rate", 0.1)
     include_fft = kwargs.get("include_fft", False)
     include_text = kwargs.get("include_text", False)
-    inp_dim2 = kwargs.get("inp_dim2", None)
+    text_feature_dim = kwargs.get("text_feature_dim", 768)
     seed_value = kwargs.get("seed", 100)
     num_classes = kwargs.get("num_classes", 2)
     lstm_dim = kwargs.get("lstm_dim", 32)
     embedding_activation = kwargs.get("embedding_activation", "linear")
     lstm_activation = kwargs.get("lstm_activation", "relu")
     final_activation = kwargs.get("final_activation", "sigmoid")
+    include_item_categories = kwargs.get("include_item_categories", False)
+    num_categories = kwargs.get("num_categories", 153)
+    mask_zero = kwargs.get("mask_zero", True)
 
     #     n_outputs = train_y.shape[1]
     #     _, inp_seq_len, inp_features = train_X[0].shape
@@ -150,7 +154,7 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     if include_text:
         t_in2, t_flat2 = transformer_layer(
             inp_seq_len,
-            inp_dim2,
+            text_feature_dim,
             num_layers,
             d_model,
             num_heads,
@@ -165,7 +169,8 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     else:
         merge = flat[0]
 
-    lstm_out = LSTM(lstm_dim, activation=lstm_activation, return_sequences=False)(merge)
+    lstm_out = LSTM(lstm_dim, activation=lstm_activation,
+                    return_sequences=False)(merge)
     # lstm_out = Dropout(0.2)(lstm_out)
     if num_classes == 2:
         dense1 = Dense(1, activation=final_activation)(lstm_out)
@@ -238,7 +243,8 @@ def build_set_transformer(inp_seq_len, inp_dim, **kwargs):
     else:
         inps = inp1
 
-    lstm_out = LSTM(lstm_dim, activation=lstm_activation, return_sequences=False)(y)
+    lstm_out = LSTM(lstm_dim, activation=lstm_activation,
+                    return_sequences=False)(y)
     # lstm_out = Dropout(0.2)(lstm_out)
     if num_classes == 2:
         output = Dense(1, activation=final_activation)(lstm_out)
@@ -317,7 +323,8 @@ def build_multitask_set_transformer(inp_seq_len, inp_dim, **kwargs):
             h=num_heads,
             activation=embedding_activation,
         )(embedded_text)
-        combined_image_text = concatenate([encoded_image, encoded_text], axis=-1)
+        combined_image_text = concatenate(
+            [encoded_image, encoded_text], axis=-1)
         inps = [inp_image, inp_text]
     else:
         inps = inp_image
@@ -337,9 +344,11 @@ def build_multitask_set_transformer(inp_seq_len, inp_dim, **kwargs):
     )
     # lstm_out = Dropout(0.2)(lstm_out)
     if num_classes == 2:
-        output = Dense(1, activation=final_activation, name=model_name2)(lstm_out)
+        output = Dense(1, activation=final_activation,
+                       name=model_name2)(lstm_out)
     else:
-        output = Dense(num_classes, activation="softmax", name=model_name2)(lstm_out)
+        output = Dense(num_classes, activation="softmax",
+                       name=model_name2)(lstm_out)
 
     outputs = [output, class_probs]
 
@@ -373,7 +382,8 @@ def build_multitask_set_transformer(inp_seq_len, inp_dim, **kwargs):
             tf.norm(neg_text_embedded, axis=-1), axis=-1
         )
 
-        positive_prod = tf.keras.layers.Multiply()([embedded_image, embedded_text])
+        positive_prod = tf.keras.layers.Multiply()(
+            [embedded_image, embedded_text])
         positive_prod = tf.reduce_sum(positive_prod, axis=-1)
 
         # image vs negative texts
@@ -405,7 +415,8 @@ def build_multitask_set_transformer(inp_seq_len, inp_dim, **kwargs):
         )
         contrastive_loss = loss_1 + loss_2
         contrastive_loss = tf.reduce_sum(contrastive_loss, axis=[-1, -2])
-        contrastive_loss = tf.expand_dims(contrastive_loss, axis=-1, name="contrastive")
+        contrastive_loss = tf.expand_dims(
+            contrastive_loss, axis=-1, name="contrastive")
         outputs.append(contrastive_loss)
 
     model = Model(inputs=inps, outputs=outputs, name="set_transformer")
@@ -428,7 +439,8 @@ class MultiTaskSetTransformer(tf.keras.Model):
         self.num_induce = kwargs.get("num_induce", 6)
         self.include_text = kwargs.get("include_text", True)
         self.first_activation = kwargs.get("first_activation", "tanh")
-        self.embedding_activation = kwargs.get("embedding_activation", "linear")
+        self.embedding_activation = kwargs.get(
+            "embedding_activation", "linear")
         self.lstm_dim = kwargs.get("lstm_dim", 32)
         self.lstm_activation = kwargs.get("lstm_activation", "relu")
         self.final_activation = kwargs.get("final_activation", "sigmoid")
@@ -439,8 +451,10 @@ class MultiTaskSetTransformer(tf.keras.Model):
         self.margin = kwargs.get("margin", 0.2)
         # tf.keras.backend.set_floatx("float32")
 
-        self.image_embedding = Dense(self.d_model, activation=self.first_activation)
-        self.text_embedding = Dense(self.d_model, activation=self.first_activation)
+        self.image_embedding = Dense(
+            self.d_model, activation=self.first_activation)
+        self.text_embedding = Dense(
+            self.d_model, activation=self.first_activation)
 
         self.image_encoder = STEncoder(
             n=self.num_layers,
@@ -458,7 +472,8 @@ class MultiTaskSetTransformer(tf.keras.Model):
         )
         classification_layers = tf.keras.models.Sequential(
             [
-                tf.keras.layers.Dense(self.num_categories, activation="softmax"),
+                tf.keras.layers.Dense(
+                    self.num_categories, activation="softmax"),
             ]
         )
         self.time_distributed = tf.keras.layers.TimeDistributed(
@@ -489,14 +504,16 @@ class MultiTaskSetTransformer(tf.keras.Model):
 
         encoded_image = self.image_encoder(embedded_image)
         encoded_text = self.text_encoder(embedded_text)
-        combined_image_text = concatenate([encoded_image, encoded_text], axis=-1)
+        combined_image_text = concatenate(
+            [encoded_image, encoded_text], axis=-1)
         lstm_out = self.rnn(combined_image_text)
         compatibility_output = self.output_layer(lstm_out)
         class_probs = self.time_distributed(combined_image_text)
 
         # process negative images
         neg_image_embedded = self.image_embedding(neg_image)
-        neg_image_embedded = tf.keras.utils.normalize(neg_image_embedded, axis=-1)
+        neg_image_embedded = tf.keras.utils.normalize(
+            neg_image_embedded, axis=-1)
 
         # process negative texts
         neg_text_embedded = self.text_embedding(neg_text)
@@ -507,7 +524,8 @@ class MultiTaskSetTransformer(tf.keras.Model):
         # positive_prod = tf.matmul(
         #     embedded_image, tf.transpose(embedded_text, perm=[0, 2, 1])
         # )
-        positive_prod = tf.keras.layers.Multiply()([embedded_image, embedded_text])
+        positive_prod = tf.keras.layers.Multiply()(
+            [embedded_image, embedded_text])
         positive_prod = tf.reduce_sum(positive_prod, axis=-1)
 
         # image vs negative texts
@@ -523,7 +541,8 @@ class MultiTaskSetTransformer(tf.keras.Model):
         negative_text_image = tf.reduce_sum(negative_text_image, axis=-1)
 
         contrastive_loss_1 = (
-            self.margin - tf.expand_dims(positive_prod, -1) + negative_image_text
+            self.margin -
+            tf.expand_dims(positive_prod, -1) + negative_image_text
         )
         condition_1 = tf.less(contrastive_loss_1, 0.0)
         loss_1 = tf.where(
@@ -531,7 +550,8 @@ class MultiTaskSetTransformer(tf.keras.Model):
         )
 
         contrastive_loss_2 = (
-            self.margin - tf.expand_dims(positive_prod, -1) + negative_text_image
+            self.margin -
+            tf.expand_dims(positive_prod, -1) + negative_text_image
         )
         condition_2 = tf.less(contrastive_loss_2, 0.0)
         loss_2 = tf.where(
