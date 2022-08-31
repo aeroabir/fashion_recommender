@@ -172,10 +172,11 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         return output, attention_weights
 
 
-def point_wise_feed_forward_network(d_model, dff):
+def point_wise_feed_forward_network(d_model, dff, rate=0.1):
     return tf.keras.Sequential(
         [
             tf.keras.layers.Dense(dff, activation="relu"),  # (batch_size, seq_len, dff)
+            tf.keras.layers.Dropout(rate),
             tf.keras.layers.Dense(d_model),  # (batch_size, seq_len, d_model)
         ]
     )
@@ -186,7 +187,7 @@ class EncoderLayer(tf.keras.layers.Layer):
         super(EncoderLayer, self).__init__()
 
         self.mha = MultiHeadAttention(d_model, num_heads)
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
+        self.ffn = point_wise_feed_forward_network(d_model, dff, rate)
 
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -196,6 +197,20 @@ class EncoderLayer(tf.keras.layers.Layer):
 
     def call(self, x, training, mask):
 
+        # https://github.com/chao-ji/tf-transformer/blob/0e3708b1e84d9fcb9a6dd7850a83d87c32f0b39f/model.py
+        query = reference = self.layernorm1(x)
+        attn_output, _ = self.mha(query, reference, reference, mask)  # (batch_size, input_seq_len, d_model)
+        # attn_output --> outputs
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.layernorm1(x + attn_output)
+        # ffn_inputs --> attn_output + x
+
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = ffn_output + attn_output + x
+        return out2
+
+        # original version
         attn_output, _ = self.mha(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(x + attn_output)  # (batch_size, input_seq_len, d_model)
@@ -216,7 +231,7 @@ class DecoderLayer(tf.keras.layers.Layer):
         self.mha1 = MultiHeadAttention(d_model, num_heads)
         self.mha2 = MultiHeadAttention(d_model, num_heads)
 
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
+        self.ffn = point_wise_feed_forward_network(d_model, dff, rate)
 
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -280,6 +295,7 @@ class Encoder(tf.keras.layers.Layer):
         ]
 
         self.dropout = tf.keras.layers.Dropout(rate)
+        self.layernorm = tf.keras.layers.LayerNormalization()
 
     def call(self, x, training):
 
@@ -296,6 +312,8 @@ class Encoder(tf.keras.layers.Layer):
 
         for i in range(self.num_layers):
             x = self.enc_layers[i](x, training, mask)
+
+        x = self.layernorm(x)
 
         return x  # (batch_size, input_seq_len, d_model)
 

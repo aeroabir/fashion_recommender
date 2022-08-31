@@ -92,6 +92,9 @@ if __name__ == "__main__":
     patience = 5
     reload_model = False
     rnn_d_model = 512
+    rnn_dropout_rate = 0.5
+    monitor = "val_auc"
+    optimizer = "adam"
 
     with open(os.path.join(train_dir, train_json), 'r') as fr:
         train_pos = json.load(fr)
@@ -176,6 +179,7 @@ if __name__ == "__main__":
                                              image_data_type=image_data_type,
                                              include_multihead_attention=False,
                                              image_encoder=image_encoder,
+                                             rate=rnn_dropout_rate,
                                              )
     elif model_type == "transformer":
         model = build_multilevel_transformer(max_seq_len,
@@ -295,18 +299,20 @@ if __name__ == "__main__":
         test_auc = get_accuracy_auc(test_gen, model)
         print(f"AUC: Train {train_auc}, Valid {valid_auc} and Test {test_auc}")
 
-    # opt = keras.optimizers.Adam(learning_rate=learning_rate)
-    opt = keras.optimizers.Nadam(learning_rate=learning_rate)
+    if optimizer == "adam":
+        opt = keras.optimizers.Adam(learning_rate=learning_rate)
+    elif optimizer == "nadam":
+        opt = keras.optimizers.Nadam(learning_rate=learning_rate)
     loss = tf.keras.losses.BinaryCrossentropy(
         from_logits=False, name='binary_crossentropy')
     model.compile(loss=loss, optimizer=opt, metrics=[
                   tf.keras.metrics.AUC()])  # "accuracy"
-    callback = EarlyStopping(
-        monitor="val_loss",
+    es_callback = EarlyStopping(
+        monitor=monitor,
         min_delta=0,
         patience=patience,
         verbose=0,
-        mode="auto",
+        mode="max",  # for AUC it should be 'max'
         baseline=None,
         restore_best_weights=True,
     )
@@ -320,29 +326,34 @@ if __name__ == "__main__":
     model_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_filepath,
         save_weights_only=True,
-        monitor='val_loss',
+        monitor=monitor,
         mode='min',
         save_best_only=True)
 
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                                  patience=3, min_lr=1e-07)
+    # if monitor = 'val_auc' then mode should be 'max'
+    reduce_lr = ReduceLROnPlateau(monitor=monitor,
+                                  factor=0.5, mode='max',
+                                  patience=1, min_lr=1e-07)
 
     # run = wandb.init(reinit=True)
     history = model.fit(train_gen,
                         epochs=epochs,
                         batch_size=batch_size,
-                        #                     steps_per_epoch=math.ceil(num_train/batch_size),
+                        # steps_per_epoch=math.ceil(num_train/batch_size),
                         validation_data=valid_gen,
                         validation_batch_size=32,
                         validation_freq=1,
-                        callbacks=[callback, reduce_lr],
+                        callbacks=[reduce_lr, es_callback],  # es_callback
                         verbose=1)
     # run.finish()
+    max_trn_auc = max(history.history['auc'])
     max_val_auc = max(history.history['val_auc'])
+    print(
+        f"Training completed, maximum training & validation AUC: {max_trn_auc:.4f} and {max_val_auc:.4f}")
 
-    train_auc = get_accuracy_auc(train_gen, model)
+    # train_auc = get_accuracy_auc(train_gen, model)
     valid_auc = get_accuracy_auc(valid_gen, model)
     test_auc = get_accuracy_auc(test_gen, model)
 
-    print(f"AUC: Train {train_auc}, Valid {valid_auc} and Test {test_auc}")
+    print(f"AUC: Valid {valid_auc:.4f} and Test {test_auc:.4f}")
     print("DONE!")

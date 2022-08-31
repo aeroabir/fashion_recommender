@@ -108,6 +108,81 @@ class image_embedding_layer(tf.keras.layers.Layer):
         return self.layer(input_tensor)
 
 
+def build_single_transformer(inp_seq_len, inp_dim, **kwargs):
+    """
+    single Transformer attending to all the features
+    """
+
+    num_layers = kwargs.get("num_layers", 2)
+    d_model = kwargs.get("d_model", 128)
+    num_heads = kwargs.get("num_heads", 8)
+    dff = kwargs.get("dff", 128)
+    rate = kwargs.get("rate", 0.1)
+    include_text = kwargs.get("include_text", False)
+    text_feature_dim = kwargs.get("text_feature_dim", 768)
+    seed_value = kwargs.get("seed", 100)
+    num_classes = kwargs.get("num_classes", 2)
+    lstm_dim = kwargs.get("lstm_dim", 32)
+    embedding_activation = kwargs.get("embedding_activation", "linear")
+    lstm_activation = kwargs.get("lstm_activation", "relu")
+    final_activation = kwargs.get("final_activation", "sigmoid")
+    include_item_categories = kwargs.get("include_item_categories", False)
+    num_categories = kwargs.get("num_categories", 154)
+    mask_zero = kwargs.get("mask_zero", True)
+
+    seed(seed_value)
+    set_seed(seed_value)
+
+    # image data - must
+    in1 = Input(shape=(inp_seq_len, inp_dim))
+    image_embedding = Dense(d_model, activation=embedding_activation)
+    image_projected = image_embedding(in1)
+    inputs, flat = [in1], [image_projected]
+    d_model_trfmr = d_model
+
+    if include_text:
+        in2 = Input(shape=(inp_seq_len, text_feature_dim))
+        text_embedding = Dense(d_model, activation=embedding_activation)
+        text_projected = text_embedding(in2)
+        inputs.append(in2)
+        flat.append(text_projected)
+        d_model_trfmr += d_model
+
+    if include_item_categories:
+        in3 = Input(shape=(inp_seq_len,))  # (?, 8)
+        first_embedder = tf.keras.layers.Embedding(
+            input_dim=num_categories,
+            output_dim=d_model,
+            embeddings_initializer="uniform",
+            mask_zero=mask_zero,
+        )
+        category_embedded = first_embedder(in3)
+        inputs.append(in3)
+        flat.append(category_embedded)
+        d_model_trfmr += d_model
+
+    if len(flat) > 1:
+        merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
+    else:
+        merge = flat[0]
+
+    encoder = Encoder(
+        num_layers, d_model_trfmr, num_heads, dff, inp_seq_len, rate, embedding_activation
+    )
+    merge = encoder(merge, True)
+    lstm_out = LSTM(lstm_dim, activation=lstm_activation,
+                    return_sequences=False)(merge)
+    # lstm_out = Dropout(0.2)(lstm_out)
+    if num_classes == 2:
+        dense1 = Dense(1, activation=final_activation)(lstm_out)
+    else:
+        dense1 = Dense(num_classes, activation="softmax")(lstm_out)
+    output = dense1
+
+    model = Model(inputs=inputs, outputs=output)
+    return model
+
+
 def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     """
     the input sequence length is same as the output sequence length
@@ -118,7 +193,6 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
     num_heads = kwargs.get("num_heads", 8)
     dff = kwargs.get("dff", 128)
     rate = kwargs.get("rate", 0.1)
-    include_fft = kwargs.get("include_fft", False)
     include_text = kwargs.get("include_text", False)
     text_feature_dim = kwargs.get("text_feature_dim", 768)
     seed_value = kwargs.get("seed", 100)
@@ -165,6 +239,26 @@ def build_multilevel_transformer(inp_seq_len, inp_dim, **kwargs):
         )
         inputs.append(t_in2)
         flat.append(t_flat2)
+
+    if include_item_categories:
+        in3 = Input(shape=(inp_seq_len,))  # (?, 8)
+        first_embedder = tf.keras.layers.Embedding(
+            input_dim=num_categories,
+            output_dim=d_model,
+            embeddings_initializer="uniform",
+            mask_zero=mask_zero,
+        )
+        # category_embedder.add(first_embedder)
+        trfmr_encoder = Encoder(
+            num_layers, d_model, num_heads, dff, inp_seq_len, rate, embedding_activation
+        )
+    # category_embedder.add(rnn_encoder)
+    category_embedded = first_embedder(in3)
+    category_embedded = trfmr_encoder(category_embedded, True)
+    inputs.append(in3)
+    flat.append(category_embedded)
+
+    if len(flat) > 1:
         merge = concatenate(flat, axis=-1)  # (b, inp_seq_len, h)
     else:
         merge = flat[0]

@@ -71,10 +71,10 @@ class SubspaceAttn(tf.keras.Model):
         image, cat1, cat2 = x
         cat1 = self.category_embedder(cat1)  # (None, s, 32)
         cat2 = self.category_embedder(cat2)  # (None, 32)
-        cat2 = RepeatVector(self.seq_len)(cat2)  # (None, 8, 32)
-        joined = concatenate([cat1, cat2], axis=-1)
+        cat2 = RepeatVector(self.seq_len)(cat2)  # (None, s, 32)
+        joined = concatenate([image, cat1, cat2], axis=-1)
         out = self.hidden(joined)
-        weights = self.final(out)  # (None, 8, 6)
+        weights = self.final(out)  # (None, s, 6)
         learnt_masks = self.masks(joined)
         learnt_masks = Reshape(
             (self.seq_len, self.num_subspace, self.input_dim))(learnt_masks)

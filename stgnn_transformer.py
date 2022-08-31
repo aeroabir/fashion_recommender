@@ -6,6 +6,7 @@ from SelfAttention_Family import FullAttention, AttentionLayer
 
 # from layers.Embed import DataEmbedding
 import sys
+import Resnet_18
 
 
 class GLU(nn.Module):
@@ -39,9 +40,11 @@ class StockBlockLayer(nn.Module):
         self.forecast = nn.Linear(
             self.time_step * self.multi, self.time_step * self.multi
         )
-        self.forecast_result = nn.Linear(self.time_step * self.multi, self.time_step)
+        self.forecast_result = nn.Linear(
+            self.time_step * self.multi, self.time_step)
         if self.stack_cnt == 0:
-            self.backcast = nn.Linear(self.time_step * self.multi, self.time_step)
+            self.backcast = nn.Linear(
+                self.time_step * self.multi, self.time_step)
         self.backcast_short_cut = nn.Linear(self.time_step, self.time_step)
         self.relu = nn.ReLU()
         self.GLUs = nn.ModuleList()
@@ -125,7 +128,8 @@ class StockBlockLayer(nn.Module):
         )
         # print(" real:", real.shape)
         # print(" imag:", img.shape)
-        time_step_as_inner = torch.cat([real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
+        time_step_as_inner = torch.cat(
+            [real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
         # print(" join:", time_step_as_inner.shape)
         iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
         # print(" ifft:", iffted.shape)
@@ -137,11 +141,13 @@ class StockBlockLayer(nn.Module):
         x = x.unsqueeze(1)  # [32, 1, 1, 6, 96]
 
         gfted = torch.matmul(mul_L, x)  # [32, 5, 1, 6, 96]
-        gconv_input = self.spe_seq_cell(gfted).unsqueeze(2)  # [32, 5, 1, 6, 192]
+        gconv_input = self.spe_seq_cell(
+            gfted).unsqueeze(2)  # [32, 5, 1, 6, 192]
         # weight shape: [1, 5, 1, 192, 192]
 
         igfted = torch.matmul(gconv_input, self.weight)  # [32, 5, 1, 6, 192]
-        igfted = torch.sum(igfted, dim=1)  # [32, 1, 6, inp_seq_len * multi = 192]
+        # [32, 1, 6, inp_seq_len * multi = 192]
+        igfted = torch.sum(igfted, dim=1)
 
         forecast_source = torch.sigmoid(
             self.forecast(igfted).squeeze(1)
@@ -156,53 +162,98 @@ class StockBlockLayer(nn.Module):
         return forecast
 
 
+class SimpleModel(nn.Module):
+    def __init__(self, **kwargs):
+        super(SimpleModel, self).__init__()
+        image_embed_dim = kwargs.get("image_embed_dim", 1280)
+        d_model = kwargs.get("d_model", 128)
+        max_seq_len = kwargs.get("max_seq_len", 8)
+        device = kwargs.get("device", "cpu")
+
+        self.image_projector = nn.Sequential(
+            nn.Linear(image_embed_dim, d_model),
+            nn.Tanh())
+
+        self.final = nn.Sequential(
+            nn.Linear(max_seq_len * d_model, 1),
+            # nn.Sigmoid(),  # for binary classification
+        )
+        self.to(device)
+
+    def forward(self, x):
+        x_image = x[0]
+        y_image = self.image_projector(x_image)
+        y_image = torch.flatten(y_image, start_dim=1)
+        out = self.final(y_image)
+        return out
+
 class BaseTransformer(nn.Module):
-    def __init__(self, inp_dim_image, inp_dim_text, **kwargs):
+    def __init__(self, **kwargs):
         super(BaseTransformer, self).__init__()
         num_layers = kwargs.get("num_layers", 2)
         d_model = kwargs.get("d_model", 128)
         num_heads = kwargs.get("num_heads", 8)
         dff = kwargs.get("dff", 128)
         rate = kwargs.get("rate", 0.1)
-        components = kwargs.get("components", 1)
-        include_fft = kwargs.get("include_fft", False)
         seed_value = kwargs.get("seed", 100)
         num_classes = kwargs.get("num_classes", 2)
         lstm_dim = kwargs.get("lstm_dim", 32)
         device = kwargs.get("device", "cpu")
         embedding_activation = kwargs.get("embedding_activation", "linear")
-        encoder_activation = kwargs.get("encoder_activation", "linear")
+        encoder_activation = kwargs.get("encoder_activation", "relu")
         lstm_activation = kwargs.get("lstm_activation", "relu")
         final_activation = kwargs.get("final_activation", "sigmoid")
+        image_data_type = kwargs.get("image_data_type", "embedding")
+        include_text = kwargs.get("include_text", False)
+        image_embed_dim = kwargs.get("image_embed_dim", 1280)
+        text_embed_dim = kwargs.get("text_embed_dim", 768)
+        image_encoder = kwargs.get("image_encoder", "resnet18")
+        include_item_categories = kwargs.get("include_item_categories", False)
+        num_categories = kwargs.get("num_categories", 154)
 
         self.lstm_dim = lstm_dim
+        self.image_data_type = image_data_type
+        self.include_text = include_text
+        self.include_item_categories = include_item_categories
+        d_model_trfmr = d_model
 
-        self.image_projector = nn.Linear(inp_dim_image, d_model)
-        image_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
+        if self.image_data_type in ["original", "both"]:
+            if image_encoder == "resnet18":
+                self.image_embedder = Resnet_18.resnet18(
+                    pretrained=True, embedding_size=d_model)
+
+        if self.image_data_type in ["embedding", "both"]:
+            self.image_projector = nn.Sequential(
+                nn.Linear(image_embed_dim, d_model),
+                nn.Tanh())
+
+        if self.include_text:
+            self.text_projector = nn.Sequential(
+                nn.Linear(text_embed_dim, d_model),
+                nn.Tanh())
+            d_model_trfmr += d_model
+
+        if self.include_item_categories:
+            self.category_embedder = torch.nn.Embedding(
+                num_embeddings=num_categories, embedding_dim=d_model, padding_idx=0)
+            d_model_trfmr += d_model
+
+        # single transformer for all features
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model_trfmr,
             nhead=num_heads,
             dim_feedforward=dff,
+            dropout=rate,
             batch_first=True,
             activation=encoder_activation,
         )
-        self.image_transformer = nn.TransformerEncoder(
-            image_encoder_layer, num_layers=num_layers
-        )
-
-        self.text_projector = nn.Linear(inp_dim_text, d_model)
-        text_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=num_heads,
-            dim_feedforward=dff,
-            batch_first=True,
-            activation=encoder_activation,
-        )
-        self.text_transformer = nn.TransformerEncoder(
-            text_encoder_layer, num_layers=num_layers
+        layer_norm = nn.LayerNorm(d_model_trfmr)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, norm=layer_norm,
         )
 
         self.rnn = nn.LSTM(
-            input_size=2 * d_model,
+            input_size=d_model_trfmr,
             hidden_size=lstm_dim,
             num_layers=1,
             bidirectional=True,
@@ -211,26 +262,66 @@ class BaseTransformer(nn.Module):
 
         self.final = nn.Sequential(
             nn.Linear(2 * lstm_dim, 1),
-            nn.Sigmoid(),  # for binary classification
+            # nn.Sigmoid(),  # for binary classification
         )
 
         self.to(device)
 
     def forward(self, x):
-        x_image = x[0]
-        x_text = x[1]
-        y_image = self.image_projector(x_image)
-        y_image = self.image_transformer(y_image)
+        flat = []
+        counter = 0
+        x_image = x[counter]
+        if self.image_data_type == "original":
+            seq_len = x_image.shape[1]
+            y_image = []
+            # since there is no TimeDistributed()
+            for jj in range(seq_len):
+                img_ii = x_image[:, jj, :, :, :]  # (?, 1, 3, 112, 112)
+                img_ii = torch.squeeze(img_ii, dim=1)
+                # img_ii = torch.transpose(img_ii, 1, 3)
+                h = self.image_embedder(img_ii)  # (?, 64)
+                y_image.append(h)
+            y_image = torch.stack(y_image, dim=1)
 
-        y_text = self.text_projector(x_text)
-        y_text = self.text_transformer(y_text)
+        elif self.image_data_type == "embedding":
+            y_image = self.image_projector(x_image)
+        # y_image = self.image_transformer(y_image)
 
-        y = torch.cat([y_image, y_text], dim=-1)
-        output, (h_N, c_N) = self.rnn(y)
+        flat.append(y_image)
+
+        if self.include_text:
+            counter += 1
+            x_text = x[counter]
+            y_text = self.text_projector(x_text)
+            # y_text = self.text_transformer(y_text)
+            flat.append(y_text)
+
+        if self.include_item_categories:
+            counter += 1
+            x_cat = x[counter]
+            y_cat = self.category_embedder(x_cat)
+            flat.append(y_cat)
+            src_key_mask = x_cat.eq(0)
+
+        # last input, sequence length for each example in a batch
+        counter += 1
+        seq_lens = x[counter].to('cpu')
+
+        y = torch.cat(flat, dim=-1)
+
+        # https://stackoverflow.com/questions/62399243/transformerencoder-with-a-padding-mask
+        # y = self.transformer(y, src_key_padding_mask=src_key_mask)  # (?, s, h)
+
+        # https://pytorch.org/docs/stable/generated/torch.nn.utils.rnn.pack_padded_sequence.html
+        y_padded = torch.nn.utils.rnn.pack_padded_sequence(
+            y, seq_lens, batch_first=True, enforce_sorted=False)
+        output, (h_N, c_N) = self.rnn(y_padded)
+        # output = (?, s, 2*h')
+        # h_N, c_N = (2, ?, h')
         # batch_dim = x_image.shape[0]
-        h_N = h_N.view(-1, 2 * self.lstm_dim)
+        h_N = h_N.view(-1, 2 * self.lstm_dim)  # (?, 2*h')
         out = self.final(h_N)
-        return out, output
+        return out
 
 
 class Model(nn.Module):
@@ -283,9 +374,11 @@ class Model(nn.Module):
                 input_size=self.time_step, hidden_size=self.unit
             )
         elif self.encoder == "lstm":
-            self.encoder_model = nn.LSTM(self.time_step, self.unit, bidirectional=False)
+            self.encoder_model = nn.LSTM(
+                self.time_step, self.unit, bidirectional=False)
         elif self.encoder == "bilstm":
-            self.encoder_model = nn.LSTM(self.time_step, self.unit, bidirectional=True)
+            self.encoder_model = nn.LSTM(
+                self.time_step, self.unit, bidirectional=True)
             self.encoder_proj = nn.Linear(int(2 * self.unit), int(self.unit))
         self.multi_layer = multi_layer
         if not only_transformer:
@@ -440,7 +533,8 @@ class Model(nn.Module):
         cheb_poly[1] = second_laplacian
         for ik in range(2, self.order):
             cheb_poly[ik] = (
-                2 * torch.matmul(laplacian, cheb_poly[ik - 1]) - cheb_poly[ik - 2]
+                2 * torch.matmul(laplacian,
+                                 cheb_poly[ik - 1]) - cheb_poly[ik - 2]
             )
 
         #         third_laplacian = (2 * torch.matmul(laplacian, second_laplacian)) - first_laplacian
@@ -465,7 +559,8 @@ class Model(nn.Module):
         degree_l = torch.diag(degree)
         diagonal_degree_hat = torch.diag(1 / (torch.sqrt(degree) + 1e-7))
         laplacian = torch.matmul(
-            diagonal_degree_hat, torch.matmul(degree_l - attention, diagonal_degree_hat)
+            diagonal_degree_hat, torch.matmul(
+                degree_l - attention, diagonal_degree_hat)
         )  # (N X N)
         # print("    L: ", laplacian.shape)
         mul_L = self.cheb_polynomial(laplacian)
@@ -518,7 +613,8 @@ class Model(nn.Module):
         imag_ii, _ = self.fft_transformer(imag)
         real = real_ii.permute(0, 2, 1).contiguous()
         img = imag_ii.permute(0, 2, 1).contiguous()
-        time_step_as_inner = torch.cat([real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
+        time_step_as_inner = torch.cat(
+            [real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
         iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
         iffted = iffted.permute(0, 2, 1)  # [32, 96, 32]
         return iffted
@@ -559,8 +655,10 @@ class Model(nn.Module):
             forecast = torch.cat([forecast, forecast1], dim=-2)
 
         if self.use_fft_transformer:
-            forecast_fft = torch.cat(result_fft, dim=-1)  # [b, s, order * d_model]
-            forecast_fft = forecast_fft.permute(0, 2, 1)  # [b, order * d_model, s]
+            # [b, s, order * d_model]
+            forecast_fft = torch.cat(result_fft, dim=-1)
+            forecast_fft = forecast_fft.permute(
+                0, 2, 1)  # [b, order * d_model, s]
             forecast = torch.cat([forecast, forecast_fft], dim=-2)
 
         forecast = self.encoder2(forecast)  # [b, order * d_model, H]
