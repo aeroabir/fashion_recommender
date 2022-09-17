@@ -13,6 +13,8 @@ import numpy as np
 import random
 import sys
 from tqdm import tqdm
+import uuid
+
 # from transformers import BertTokenizer, BertModel
 
 # import torch
@@ -56,17 +58,14 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.image_embedding_dim = kwargs.get("image_embedding_dim", 1280)
         self.text_embedding_dim = kwargs.get("text_embedding_dim", 768)
         self.image_embedding_file = kwargs.get("image_embedding_file", None)
-        self.return_item_categories = kwargs.get(
-            "return_item_categories", False)
-        self.return_negative_samples = kwargs.get(
-            "return_negative_samples", False)
+        self.return_item_categories = kwargs.get("return_item_categories", False)
+        self.return_negative_samples = kwargs.get("return_negative_samples", False)
         self.number_negative_samples = kwargs.get("number_negative_samples", 0)
         self.label_dict = kwargs.get("label_dict", None)
         self.number_items_in_batch = kwargs.get("number_items_in_batch", None)
         self.variable_length_input = kwargs.get("variable_length_input", True)
         self.text_embedding_file = kwargs.get("text_embedding_file", None)
-        self.include_item_categories = kwargs.get(
-            "include_item_categories", False)
+        self.include_item_categories = kwargs.get("include_item_categories", False)
         self.category_mask_zero = kwargs.get("category_mask_zero", True)
 
         # image data can be one of "embedding", "original", "both"
@@ -84,7 +83,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
                 else:
                     padding = 0
                 all_item_categories = set(
-                    [item_description[item]['category_id'] for item in item_description])
+                    [item_description[item]["category_id"] for item in item_description]
+                )
                 self.label_dict = {}
                 for ii, k in enumerate(all_item_categories):
                     self.label_dict[k] = ii + padding
@@ -177,8 +177,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
             print("cannot find!!")
             print(item_id, item_cat)
             print(item_pool)
-        neg_items = np.random.randint(
-            low=0, high=len(item_pool), size=num_negative)
+        neg_items = np.random.randint(low=0, high=len(item_pool), size=num_negative)
         neg_items = [item_pool[ii] for ii in neg_items]
         return neg_items
 
@@ -218,8 +217,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
             zeros_image = [
                 zero_elem_image for _ in range(self.max_len - len(nimage_data))
             ]
-            zeros_text = [zero_elem_text for _ in range(
-                self.max_len - len(data))]
+            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
 
             nimage_data = zeros_image + nimage_data
             ntext_data = zeros_text + ntext_data
@@ -234,22 +232,19 @@ class CustomDataGen(tf.keras.utils.Sequence):
 
         if self.image_data == "original":
             zero_elem_image = np.zeros(self.input_size)
-            zeros_image = [zero_elem_image for _ in range(
-                self.max_len - len(data))]
+            zeros_image = [zero_elem_image for _ in range(self.max_len - len(data))]
 
         elif self.image_data == "embedding":
-            zero_elem_image = np.zeros(
-                self.image_embedding_dim)  # np.zeros((1, 1280))
-            zeros_image = [zero_elem_image for _ in range(
-                self.max_len - len(data))]
+            zero_elem_image = np.zeros(self.image_embedding_dim)  # np.zeros((1, 1280))
+            zeros_image = [zero_elem_image for _ in range(self.max_len - len(data))]
 
         elif self.image_data == "both":
             zero_elem_image = np.zeros(self.input_size)
             zero_image_vector = np.zeros(self.image_embedding_dim)
-            zeros_image_vec = [zero_image_vector for _ in range(
-                self.max_len - len(data))]
-            zeros_image_arr = [zero_elem_image for _ in range(
-                self.max_len - len(data))]
+            zeros_image_vec = [
+                zero_image_vector for _ in range(self.max_len - len(data))
+            ]
+            zeros_image_arr = [zero_elem_image for _ in range(self.max_len - len(data))]
 
         if self.only_image:
             if self.image_data in ["original", "embedding"]:
@@ -262,8 +257,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
         else:
             text_data = [x[0] for x in data]
             zero_elem_text = np.zeros(self.text_embedding_dim)
-            zeros_text = [zero_elem_text for _ in range(
-                self.max_len - len(data))]
+            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
 
             if self.image_data in ["original", "embedding"]:
                 image_data = [x[1] for x in data]
@@ -284,14 +278,27 @@ class CustomDataGen(tf.keras.utils.Sequence):
                 if self.image_data in ["original", "embedding"]:
                     x = zeros_image + image_data
                     if self.include_item_categories:
-                        return (zeros_image + image_data, zeros_text + text_data, item_cat_data)
+                        return (
+                            zeros_image + image_data,
+                            zeros_text + text_data,
+                            item_cat_data,
+                        )
                     else:
                         return (zeros_image + image_data, zeros_text + text_data)
                 elif self.image_data == "both":
                     if self.include_item_categories:
-                        return (zeros_image_vec + image_data, zeros_image_arr + image_array_data, zeros_text + text_data, item_cat_data)
+                        return (
+                            zeros_image_vec + image_data,
+                            zeros_image_arr + image_array_data,
+                            zeros_text + text_data,
+                            item_cat_data,
+                        )
                     else:
-                        return (zeros_image_vec + image_data, zeros_image_arr + image_array_data, zeros_text + text_data)
+                        return (
+                            zeros_image_vec + image_data,
+                            zeros_image_arr + image_array_data,
+                            zeros_text + text_data,
+                        )
 
     def __get_label1(self, example, pad=0):
         # creates labels for item classification
@@ -299,8 +306,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
         items = [self.item_dict[x] for x in example[: self.max_len]]
         data = []
         for item in items:
-            data.append(
-                self.label_dict[self.item_description[item]["category_id"]])
+            data.append(self.label_dict[self.item_description[item]["category_id"]])
         if len(data) < self.max_len:
             data = [pad] * (self.max_len - len(data)) + data
         return data
@@ -309,13 +315,13 @@ class CustomDataGen(tf.keras.utils.Sequence):
         # creates labels for *next* item classification
         # padded witn -1 to maintain the same sequence length
         items = [self.item_dict[x] for x in example[: self.max_len]]
-        targets = items[1:] + ['eos']
+        targets = items[1:] + ["eos"]
         data = []
         for t in targets:
             if t in batch_dict:
                 data.append(batch_dict[t])
             else:
-                data.append(batch_dict['unk'])
+                data.append(batch_dict["unk"])
         if len(data) < self.max_len:
             data = [-1] * (self.max_len - len(data)) + data
         return data
@@ -337,12 +343,11 @@ class CustomDataGen(tf.keras.utils.Sequence):
         # a label dict (dynamic)
         batch_items = set()
         for example in x_batch:
-            batch_items |= set([self.item_dict[x]
-                               for x in example[: self.max_len]])
-        batch_items = list(batch_items)[:self.number_items_in_batch]
+            batch_items |= set([self.item_dict[x] for x in example[: self.max_len]])
+        batch_items = list(batch_items)[: self.number_items_in_batch]
         batch_dict = {jj: ii for ii, jj in enumerate(batch_items)}
-        batch_dict['unk'] = len(batch_items)
-        batch_dict['eos'] = len(batch_items) + 1
+        batch_dict["unk"] = len(batch_items)
+        batch_dict["eos"] = len(batch_items) + 1
 
         # mask = np.asarray([self.__get_mask(x) for x in x_batch])
         if self.only_image:
@@ -394,8 +399,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
             y_total = y_batch
 
         if self.return_item_categories:
-            y2_batch = np.asarray(
-                [self.__get_label2(x, batch_dict) for x in x_batch])
+            y2_batch = np.asarray([self.__get_label2(x, batch_dict) for x in x_batch])
             # y2_batch = np.asarray([self.__get_label1(x) for x in x_batch])
             y_total = [y_batch, y2_batch]
 
@@ -407,8 +411,7 @@ class CustomDataGen(tf.keras.utils.Sequence):
         return X_batch, y_total
 
     def __getitem__(self, index):
-        batches = self.df[index *
-                          self.batch_size: (index + 1) * self.batch_size]
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
@@ -427,7 +430,7 @@ class CSANetGen(tf.keras.utils.Sequence):
     For each outfit, we follow these steps:
     1> take the first item as the positive image
     2> take the rest of the items as an outfit
-    3> for each item in the outfit sample an image from the same category - 
+    3> for each item in the outfit sample an image from the same category -
         this constitutes the negative set
     """
 
@@ -479,7 +482,8 @@ class CSANetGen(tf.keras.utils.Sequence):
 
         if self.get_image_embedding:
             self.zero_elem_image = np.zeros(
-                self.image_embedding_dim)  # np.zeros((1, 1280))
+                self.image_embedding_dim
+            )  # np.zeros((1, 1280))
         else:
             self.zero_elem_image = np.zeros(self.input_size)
 
@@ -487,7 +491,7 @@ class CSANetGen(tf.keras.utils.Sequence):
         X, y = [], []
         Z = []
         for outfit in tqdm(positive_samples):
-            items = [o['item_id'] for o in outfit['items']]
+            items = [o["item_id"] for o in outfit["items"]]
             pos_item = items[0]
             outfit_i = items[1:]
             neg_set, neg_cat, outfit_cat = [], [], []
@@ -498,8 +502,7 @@ class CSANetGen(tf.keras.utils.Sequence):
                 neg_cat.append(self.category2id[self.item2cat[neg]])
             X.append([outfit_i, pos_item, neg_set])
             y.append(0)
-            Z.append(
-                [outfit_cat, self.category2id[self.item2cat[pos_item]], neg_cat])
+            Z.append([outfit_cat, self.category2id[self.item2cat[pos_item]], neg_cat])
             if self.max_example and len(y) > self.max_example:
                 break
         self.df = pd.DataFrame({"X": X, "y": y, "Z": Z})
@@ -534,8 +537,7 @@ class CSANetGen(tf.keras.utils.Sequence):
             print("cannot find!!")
             print(item_id, item_cat)
             print(item_pool)
-        neg_items = np.random.randint(
-            low=0, high=len(item_pool), size=num_negative)
+        neg_items = np.random.randint(low=0, high=len(item_pool), size=num_negative)
         neg_items = [item_pool[ii] for ii in neg_items]
         return neg_items
 
@@ -561,13 +563,13 @@ class CSANetGen(tf.keras.utils.Sequence):
         return self.text_embedding_dict[item_id]
 
     def __get_input(self, example, example_cat):
-        outfit = example[0][:self.max_len]
+        outfit = example[0][: self.max_len]
         positive = example[1]
-        negatives = example[2][:self.max_len]
+        negatives = example[2][: self.max_len]
 
-        outfit_cat = example_cat[0][:self.max_len]
+        outfit_cat = example_cat[0][: self.max_len]
         positive_cat = example_cat[1]
-        negatives_cat = example_cat[2][:self.max_len]
+        negatives_cat = example_cat[2][: self.max_len]
 
         outfit_data, negative_data = [], []
         for ii, jj in zip(outfit, negatives):
@@ -576,8 +578,7 @@ class CSANetGen(tf.keras.utils.Sequence):
         pos_data = self.get_image(positive)
 
         if len(outfit) < self.max_len:
-            padding = [self.zero_elem_image for _ in range(
-                self.max_len - len(outfit))]
+            padding = [self.zero_elem_image for _ in range(self.max_len - len(outfit))]
             outfit_data = padding + outfit_data
             negative_data = padding + negative_data
 
@@ -585,7 +586,14 @@ class CSANetGen(tf.keras.utils.Sequence):
             outfit_cat = padding_2 + outfit_cat
             negatives_cat = padding_2 + negatives_cat
 
-        return outfit_data, pos_data, negative_data, outfit_cat, positive_cat, negatives_cat
+        return (
+            outfit_data,
+            pos_data,
+            negative_data,
+            outfit_cat,
+            positive_cat,
+            negatives_cat,
+        )
 
     def __get_data(self, batches):
         # Generates data containing batch_size samples
@@ -606,8 +614,7 @@ class CSANetGen(tf.keras.utils.Sequence):
         return X_batch, y_batch
 
     def __getitem__(self, index):
-        batches = self.df[index *
-                          self.batch_size: (index + 1) * self.batch_size]
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
@@ -620,9 +627,9 @@ class TripletGen(tf.keras.utils.Sequence):
     Generates a set of (anchor, positive, negative) items
     for training under triplet loss.
 
-    Ref: Mariya I. Vasileva, Bryan A. Plummer, Krishna Dusad, Shreya Rajpal, 
-    Ranjitha Kumar, and David Forsyth. Learning type-aware embeddings for 
-    fashion copatibility. In ECCV, 2018. 
+    Ref: Mariya I. Vasileva, Bryan A. Plummer, Krishna Dusad, Shreya Rajpal,
+    Ranjitha Kumar, and David Forsyth. Learning type-aware embeddings for
+    fashion copatibility. In ECCV, 2018.
     """
 
     def __init__(
@@ -653,7 +660,7 @@ class TripletGen(tf.keras.utils.Sequence):
         # in some outfit, to be used subsequently for negative sampling
         self.item_together_dict = {}
         for outfit in positive_samples:
-            items = [o['item_id'] for o in outfit['items']]
+            items = [o["item_id"] for o in outfit["items"]]
             for item in items:
                 if item not in self.item_together_dict:
                     self.item_together_dict[item] = set()
@@ -662,9 +669,9 @@ class TripletGen(tf.keras.utils.Sequence):
         # create all the training data
         X, y = [], []
         for outfit in positive_samples:
-            items = [o['item_id'] for o in outfit['items']]
+            items = [o["item_id"] for o in outfit["items"]]
             # combs = combinations(items, 2)  # too many items
-            combs = [(items[ii], items[ii+1]) for ii in range(len(items)-1)]
+            combs = [(items[ii], items[ii + 1]) for ii in range(len(items) - 1)]
             for itempair in combs:
                 anchor = itempair[0]
                 pos = itempair[1]
@@ -708,11 +715,9 @@ class TripletGen(tf.keras.utils.Sequence):
         if item_id in item_pool:
             item_pool.remove(item_id)
 
-        assert len(
-            item_pool) >= 1, f"too few items for Item-{item_id}({item_pool})"
+        assert len(item_pool) >= 1, f"too few items for Item-{item_id}({item_pool})"
 
-        neg_items = np.random.randint(
-            low=0, high=len(item_pool), size=num_negative)
+        neg_items = np.random.randint(low=0, high=len(item_pool), size=num_negative)
         neg_items = [item_pool[ii] for ii in neg_items]
         return neg_items
 
@@ -761,8 +766,7 @@ class TripletGen(tf.keras.utils.Sequence):
         return X_batch, y_batch
 
     def __getitem__(self, index):
-        batches = self.df[index *
-                          self.batch_size: (index + 1) * self.batch_size]
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
@@ -780,7 +784,7 @@ class KTupleGen(tf.keras.utils.Sequence):
     Difference with CSA-Net
     4. either triplet loss or binary cross-entropy loss.
     5. each outfit has a fixed length
-    6. there is only one negative image 
+    6. there is only one negative image
     """
 
     def __init__(
@@ -838,7 +842,7 @@ class KTupleGen(tf.keras.utils.Sequence):
             # in some outfit, to be used subsequently for negative sampling
             self.item_together_dict = {}
             for outfit in positive_samples:
-                items = [o['item_id'] for o in outfit['items']]
+                items = [o["item_id"] for o in outfit["items"]]
                 for item in items:
                     if item not in self.item_together_dict:
                         self.item_together_dict[item] = set()
@@ -848,14 +852,13 @@ class KTupleGen(tf.keras.utils.Sequence):
         X, y = [], []
         Z = []
         for outfit in tqdm(positive_samples):
-            items = [o['item_id'] for o in outfit['items']]
-            if len(items) >= self.max_outfit_length+1:
+            items = [o["item_id"] for o in outfit["items"]]
+            if len(items) >= self.max_outfit_length + 1:
                 x_, y_, z_ = self.generate_samples_basic(items)
                 X += x_.copy()
                 y += y_.copy()
                 Z += z_.copy()
-                x_, y_, z_ = self.generate_samples_combinations(
-                    items, self.fraction)
+                x_, y_, z_ = self.generate_samples_combinations(items, self.fraction)
                 X += x_.copy()
                 y += y_.copy()
                 Z += z_.copy()
@@ -908,12 +911,11 @@ class KTupleGen(tf.keras.utils.Sequence):
         # strategy-1
         for ii in range(self.max_outfit_length, len(items)):
             pos_item = items[ii]
-            outfit_i = items[:self.max_outfit_length]
+            outfit_i = items[: self.max_outfit_length]
             neg_item = self.get_negative_samples(pos_item)[0]
             pos_cat = self.category2id[self.item2cat[pos_item]]
             neg_cat = self.category2id[self.item2cat[neg_item]]
-            outfit_cat = [self.category2id[self.item2cat[item]]
-                          for item in outfit_i]
+            outfit_cat = [self.category2id[self.item2cat[item]] for item in outfit_i]
             if "triplet" in self.loss_type.lower():
                 X.append([outfit_i, pos_item, neg_item])
                 y.append(0)
@@ -931,8 +933,7 @@ class KTupleGen(tf.keras.utils.Sequence):
         X, y, Z = [], [], []
         # strategy-2 (generate multiple samples based on combinations)
         all_samples = list(combinations(items, self.max_outfit_length))
-        sampled = random.sample(
-            all_samples, k=math.floor(0.5*len(all_samples)))
+        sampled = random.sample(all_samples, k=math.floor(0.5 * len(all_samples)))
         for outfit_i in sampled:
             rest = [item for item in items if item not in outfit_i]
             if len(rest) < 1:
@@ -947,8 +948,7 @@ class KTupleGen(tf.keras.utils.Sequence):
             neg_item = self.get_negative_samples(pos_item)[0]
             pos_cat = self.category2id[self.item2cat[pos_item]]
             neg_cat = self.category2id[self.item2cat[neg_item]]
-            outfit_cat = [self.category2id[self.item2cat[item]]
-                          for item in outfit_i]
+            outfit_cat = [self.category2id[self.item2cat[item]] for item in outfit_i]
             if "triplet" in self.loss_type.lower():
                 X.append([outfit_i, pos_item, neg_item])
                 y.append(0)
@@ -977,11 +977,9 @@ class KTupleGen(tf.keras.utils.Sequence):
         if item_id in item_pool:
             item_pool.remove(item_id)
 
-        assert len(
-            item_pool) >= 1, f"too few items for Item-{item_id}({item_pool})"
+        assert len(item_pool) >= 1, f"too few items for Item-{item_id}({item_pool})"
 
-        neg_items = np.random.randint(
-            low=0, high=len(item_pool), size=num_negative)
+        neg_items = np.random.randint(low=0, high=len(item_pool), size=num_negative)
         neg_items = [item_pool[ii] for ii in neg_items]
         return neg_items
 
@@ -1097,8 +1095,7 @@ class KTupleGen(tf.keras.utils.Sequence):
         return X_batch, y_batch
 
     def __getitem__(self, index):
-        batches = self.df[index *
-                          self.batch_size: (index + 1) * self.batch_size]
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
@@ -1190,8 +1187,7 @@ class ImageDataGen(tf.keras.utils.Sequence):
         return x_batch, y_batch
 
     def __getitem__(self, index):
-        batches = self.df[index *
-                          self.batch_size: (index + 1) * self.batch_size]
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 
@@ -1203,8 +1199,8 @@ class ImageDataGen(tf.keras.utils.Sequence):
 class OutfitGen(tf.keras.utils.Sequence):
     """
     This generator creates sample outfits using a query item (list)
-    and adding one item at a time from a list of common items. The 
-    outfit thus created is evaluated by an existing model and the 
+    and adding one item at a time from a list of common items. The
+    outfit thus created is evaluated by an existing model and the
     outfit score is utilized further for creating the best outfit.
     """
 
@@ -1229,7 +1225,8 @@ class OutfitGen(tf.keras.utils.Sequence):
             self.text_embedding_dict = pickle.load(fr)
 
         common_items = set(self.image_embedding_dict.keys()).intersection(
-            self.text_embedding_dict.keys())
+            self.text_embedding_dict.keys()
+        )
 
         if type(query_item) is not list:
             query_item = [query_item]
@@ -1270,13 +1267,10 @@ class OutfitGen(tf.keras.utils.Sequence):
 
         text_data = [x[0] for x in data]
         image_data = [x[1] for x in data]
-        zero_elem_image = np.zeros(
-            self.image_embedding_dim)  # np.zeros((1, 1280))
+        zero_elem_image = np.zeros(self.image_embedding_dim)  # np.zeros((1, 1280))
         zero_elem_text = np.zeros(self.text_embedding_dim)
-        zeros_image = [zero_elem_image for _ in range(
-            self.max_len - len(data))]
-        zeros_text = [zero_elem_text for _ in range(
-            self.max_len - len(data))]
+        zeros_image = [zero_elem_image for _ in range(self.max_len - len(data))]
+        zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
 
         return (zeros_image + image_data, zeros_text + text_data)
 
@@ -1299,8 +1293,157 @@ class OutfitGen(tf.keras.utils.Sequence):
         return X_batch, y_batch
 
     def __getitem__(self, index):
-        batches = self.df[index *
-                          self.batch_size: (index + 1) * self.batch_size]
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
+        X, y = self.__get_data(batches)
+        return X, y
+
+    def __len__(self):
+        return math.ceil(self.n / self.batch_size)
+        # return self.n // self.batch_size
+
+
+class OutfitGenWithImage(tf.keras.utils.Sequence):
+    """
+    This generator creates sample outfits using a query item (list)
+    and adding one item at a time from a list of common items. The
+    outfit thus created is evaluated by an existing model and the
+    outfit score is utilized further for creating the best outfit.
+
+    The difference with OutfitGen is here the query item is an image/numpy array.
+    """
+
+    def __init__(self, query_item, **kwargs):
+        embed_dir = kwargs.get("embed_dir", None)
+        image_embed_file = kwargs.get("image_embed_file", None)
+        text_embed_file = kwargs.get("text_embed_file", None)
+        batch_size = kwargs.get("batch_size", 32)
+        max_len = kwargs.get("max_len", 8)
+        image_embedding_dim = kwargs.get("image_embedding_dim", 1280)
+        shuffle = kwargs.get("shuffle", False)
+        include_text = kwargs.get("include_text", False)
+        include_category = kwargs.get("include_category", False)
+        image_embedding_dict = kwargs.get("image_embedding_dict", None)
+        item_description_dict = kwargs.get("item_description", None)
+        item_category_dict = kwargs.get("item_category_dict", None)
+        ignore_categories = kwargs.get("ignore_categories", None)
+
+        if image_embedding_dict:
+            self.image_embedding_dict = image_embedding_dict
+
+        elif image_embedding_file:
+            image_embedding_file = os.path.join(embed_dir, image_embed_file)
+            with open(image_embedding_file, "rb") as fr:
+                self.image_embedding_dict = pickle.load(fr)
+        common_items = set(self.image_embedding_dict.keys())
+        n0 = len(common_items)
+
+        if include_text:
+            text_embedding_file = os.path.join(embed_dir, text_embed_file)
+            with open(text_embedding_file, "rb") as fr:
+                self.text_embedding_dict = pickle.load(fr)
+
+            common_items = common_items.intersection(self.text_embedding_dict.keys())
+
+        # since we filter by item category we need to ensure every item
+        # has a category
+        assert (
+            item_description_dict is not None
+        ), "Item-description-dict must be supplied!"
+        s_cat = set(item_description_dict.keys())
+        common_items = common_items.intersection(s_cat)
+
+        # remove items to be searched based on categories
+        if ignore_categories is not None:
+            for cat in ignore_categories:
+                common_items = common_items.difference(item_category_dict[cat])
+        print(f"Original {n0} items, reduced to {len(common_items)} items")
+
+        if type(query_item) is not list:
+            query_item = [query_item]
+
+        # Rewrite the query as one of them could be a TF Tensor/Numpy array
+        new_ids = []
+        for item in query_item:
+            if type(item) is not str:
+                img_id = uuid.uuid4()
+                self.image_embedding_dict[img_id] = item
+                new_ids.append(img_id)
+            else:
+                new_ids.append(item)
+
+        X, y = [], []
+        for item in common_items:
+            if item not in new_ids:
+                X.append([item] + new_ids)
+                y.append(item)
+
+        self.X_col = "X"
+        self.y_col = "y"
+        self.df = pd.DataFrame({self.X_col: X, self.y_col: y})
+        self.batch_size = batch_size
+        self.max_len = max_len
+        self.image_embedding_dim = image_embedding_dim
+        self.text_embedding_dim = 768
+        self.shuffle = shuffle
+        self.n = len(self.df)
+        self.include_text = include_text
+        self.include_category = include_category
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+    def get_texts(self, item_id):
+        return self.text_embedding_dict[item_id]
+
+    def get_image(self, item_id):
+        return self.image_embedding_dict[item_id]
+
+    def __get_input(self, example):
+        data = []
+        items = [x for x in example[: self.max_len]]
+        for item in items:
+            image = self.get_image(item)
+            if self.include_text:
+                text = self.get_texts(item)
+                data.append((text, image))
+            else:
+                data.append(image)
+
+        zero_elem_image = np.zeros(self.image_embedding_dim)  # np.zeros((1, 1280))
+        zeros_image = [zero_elem_image for _ in range(self.max_len - len(data))]
+        if self.include_text:
+            text_data = [x[0] for x in data]
+            image_data = [x[1] for x in data]
+            zero_elem_text = np.zeros(self.text_embedding_dim)
+            zeros_text = [zero_elem_text for _ in range(self.max_len - len(data))]
+            return (zeros_image + image_data, zeros_text + text_data)
+        else:
+            return zeros_image + data
+
+    def __get_output(self, label):
+        return self.label_dict[label]
+
+    def __get_data(self, batches):
+        # Generates data containing batch_size samples
+        x_batch = batches["X"].tolist()
+        y_batch = batches["y"].tolist()
+
+        combined = [self.__get_input(x) for x in x_batch]
+        if self.include_text:
+            X_batch = (
+                np.asarray([x[0] for x in combined]),
+                np.asarray([x[1] for x in combined]),
+                # mask,
+            )
+        else:
+            X_batch = np.asarray(combined)
+
+        y_batch = np.asarray([int(y) for y in y_batch])
+        return X_batch, y_batch
+
+    def __getitem__(self, index):
+        batches = self.df[index * self.batch_size : (index + 1) * self.batch_size]
         X, y = self.__get_data(batches)
         return X, y
 

@@ -8,6 +8,7 @@ polyvore-dataset/
 *.pickle
 *.png
 *.h5
+*.jpg
 /wandb/
 /finetuned_efficientnet/
 /logs/
@@ -16,3 +17,7 @@ polyvore-dataset/
 /compatibility*/
 /fashion-compatibility/
 /triplet_loss_nondisjoint/
+/Clothing-Detection/
+/Nordstrom/
+/STL-Dataset/
+/fashionIQ/

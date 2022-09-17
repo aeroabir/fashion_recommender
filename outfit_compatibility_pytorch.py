@@ -1,3 +1,4 @@
+import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
@@ -13,15 +14,81 @@ import torch
 import torch.utils.data as torch_data
 import torch.nn as nn
 from numpy.random import seed
+from prettytable import PrettyTable
 
 from stgnn_transformer import BaseTransformer, SimpleModel
+from set_transformer_pytorch import BaseSetTransformer
 from utils_torch import CustomDataset, train
 
+parser = argparse.ArgumentParser(description='Fashion Compatibility Example')
+parser.add_argument('--batch-size', type=int, default=256, metavar='N',
+                    help='input batch size for training (default: 256)')
+parser.add_argument('--epochs', type=int, default=50, metavar='N',
+                    help='number of epochs to train (default: 10)')
+parser.add_argument('--start_epoch', type=int, default=1, metavar='N',
+                    help='number of start epoch (default: 1)')
+parser.add_argument('--lr', type=float, default=5e-5, metavar='LR',
+                    help='learning rate (default: 5e-5)')
+parser.add_argument('--seed', type=int, default=1, metavar='S',
+                    help='random seed (default: 1)')
+parser.add_argument('--no-cuda', action='store_true', default=False,
+                    help='enables CUDA training')
+parser.add_argument('--log-interval', type=int, default=250, metavar='N',
+                    help='how many batches to wait before logging training status')
+parser.add_argument('--resume', default='', type=str,
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--name', default='Type_Specific_Fashion_Compatibility', type=str,
+                    help='name of experiment')
+parser.add_argument('--polyvore_split', default='disjoint', type=str,
+                    help='specifies the split of the polyvore data (either disjoint or nondisjoint)')
+parser.add_argument('--base_dir', default='/recsys_data/RecSys/fashion/polyvore-dataset/polyvore_outfits', type=str,
+                    help='directory of the polyvore outfits dataset (default: data)')
+parser.add_argument('--test', dest='test', action='store_true', default=False,
+                    help='To only run inference on test set')
+parser.add_argument('--dim_embed', type=int, default=64, metavar='N',
+                    help='how many dimensions in embedding (default: 64)')
+parser.add_argument('--l2_embed', dest='l2_embed', action='store_true', default=False,
+                    help='L2 normalize the output of the type specific embeddings')
+parser.add_argument('--image_embedding_dim', type=int, default=1280, metavar='M',
+                    help='image embedding dimension')
+parser.add_argument('--text_embedding_dim', type=int, default=768, metavar='M',
+                    help='text embedding dimension (BERT)')
+###
+parser.add_argument('--model_name', default='transformer', type=str,
+                    help='model name')
+parser.add_argument('--transformer_name', default='pytorch', type=str,
+                    help='Transformer name (different implementation)')
+parser.add_argument('--max_seq_len', type=int, default=12, metavar='M',
+                    help='maximum number of items in an outfit')
+parser.add_argument('--image_data_type', default='embedding', type=str,
+                    help='input type of images, one of embedding, original or both')
+parser.add_argument('--d_model', type=int, default=64, metavar='M',
+                    help='transformer embedding dimension')
+parser.add_argument('--n_heads', type=int, default=2, metavar='M',
+                    help='transformer number of heads')
+parser.add_argument('--n_layers', type=int, default=1, metavar='M',
+                    help='transformer number of layers')
+parser.add_argument('--dropout_rate', type=float, default=0.1, metavar='LR',
+                    help='dropout rate (default: 0.1)')
+parser.add_argument('--loss_name', default='focal', type=str,
+                    help='Loss type')
+parser.add_argument('--freeze_layers', type=int, default=0, metavar='M',
+                    help='number of layers to freeze (in ResNet models)')
+parser.add_argument('--clip_norm', type=float, default=0.5, metavar='CN',
+                    help='gradient clipping norm')
+parser.add_argument('--use_rnn', default=False, help='include RNN layer or not')
 
-if __name__ == "__main__":
 
-    base_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/polyvore_outfits"
-    data_type = "nondisjoint"  # "nondisjoint", "disjoint"
+def main():
+    global args
+    args = parser.parse_args()
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed(args.seed)
+
+    base_dir = args.base_dir
+    data_type = args.polyvore_split
     train_dir = os.path.join(base_dir, data_type)
     image_dir = os.path.join(base_dir, "images")
     embed_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/precomputed"
@@ -35,24 +102,21 @@ if __name__ == "__main__":
     item_file = "polyvore_item_metadata.json"
     outfit_file = "polyvore_outfit_titles.json"
 
-    model_type = "transformer"  # "set-transformer", "rnn"
     include_text = True
     use_graphsage = False
-    max_seq_len = 12
-    image_data_type = "embedding"  # "original", "embedding", "both"
     include_item_categories = True
     image_encoder = "resnet18"  # "resnet50", "vgg16", "inception"
 
     model_params = {
-        "max_seq_len": max_seq_len,
-        "image_data_type": image_data_type,
-        'd_model': 64,
-        'n_heads': 16,
-        'n_layers': 6,
-        'rate': 0.1,
-        'batch_size': 128,
-        'lr': 1e-03,
-        'epochs': 100,
+        "max_seq_len": args.max_seq_len,
+        "image_data_type": args.image_data_type,
+        'd_model': args.d_model,
+        'n_heads': args.n_heads,
+        'n_layers': args.n_layers,
+        'rate': args.dropout_rate,
+        'batch_size': args.batch_size,
+        'lr': args.lr,
+        'epochs': args.epochs,
         'scheduler': None,
         'small_epochs': 1,
         'output_dir': './',
@@ -61,6 +125,12 @@ if __name__ == "__main__":
         'validate_freq': 1,
         'early_stop': True,
         'device': 'cuda',
+        'name': args.model_name,
+        'transformer_name': args.transformer_name,
+        'loss': args.loss_name,
+        'freeze_layers': args.freeze_layers,
+        'clip_norm': args.clip_norm,
+        'use_rnn': args.use_rnn,
     }
 
     if use_graphsage:
@@ -138,27 +208,52 @@ if __name__ == "__main__":
 
     device = model_params['device']
 
-    # model = BaseTransformer(num_layers=model_params['n_layers'],
-    #                         d_model=model_params['d_model'],
-    #                         num_heads=model_params['n_heads'],
-    #                         dff=32,
-    #                         rate=model_params["rate"],
-    #                         num_classes=2,
-    #                         lstm_dim=32,
-    #                         device=device,
-    #                         image_data_type=image_data_type,
-    #                         include_text=include_text,
-    #                         include_item_categories=include_item_categories,
-    #                         num_categories=154,
-    #                         embedding_activation="linear",
-    #                         encoder_activation="relu",
-    #                         lstm_activation="linear",
-    #                         final_activation="sigmoid")
+    if model_params['name'] == 'transformer':
+        model = BaseTransformer(num_layers=model_params['n_layers'],
+                                d_model=model_params['d_model'],
+                                num_heads=model_params['n_heads'],
+                                dff=64,  # 32
+                                rate=model_params["rate"],
+                                max_seq_len=args.max_seq_len,
+                                num_classes=2,
+                                lstm_dim=model_params['d_model'],
+                                device=device,
+                                image_data_type=args.image_data_type,
+                                include_text=include_text,
+                                include_item_categories=include_item_categories,
+                                num_categories=154,
+                                embedding_activation="linear",
+                                encoder_activation="relu",
+                                lstm_activation="linear",
+                                transformer_name=model_params["transformer_name"],
+                                freeze_layers=model_params["freeze_layers"],
+                                use_rnn=model_params["use_rnn"],
+                                final_activation="sigmoid")
 
-    model = SimpleModel(d_model=model_params['d_model'], 
-                        image_embedding_dim=image_embedding_dim,
-                        max_seq_len=max_seq_len,
-                        device=device,)
+    elif model_params['name'] == 'set-transformer':
+        model = BaseSetTransformer(num_layers=model_params['n_layers'],
+                                   d_model=model_params['d_model'],
+                                   num_heads=model_params['n_heads'],
+                                   dff=32,
+                                   rate=model_params["rate"],
+                                   max_seq_len=args.max_seq_len,
+                                   num_classes=2,
+                                   lstm_dim=32,
+                                   device=device,
+                                   image_data_type=args.image_data_type,
+                                   include_text=include_text,
+                                   include_item_categories=include_item_categories,
+                                   num_categories=154,
+                                   embedding_activation="linear",
+                                   encoder_activation="relu",
+                                   lstm_activation="linear",
+                                   final_activation="sigmoid")
+
+    elif model_params['name'] == 'simple':
+        model = SimpleModel(d_model=model_params['d_model'],
+                            image_embedding_dim=image_embedding_dim,
+                            max_seq_len=args.max_seq_len,
+                            device=device,)
 
     total_params = 0
     for name, parameter in model.named_parameters():
@@ -172,7 +267,7 @@ if __name__ == "__main__":
                               item_dict,
                               pv_items,
                               image_dir=image_dir,
-                              max_len=max_seq_len,
+                              max_len=args.max_seq_len,
                               only_image=not include_text,
                               image_embedding_dim=image_embedding_dim,
                               image_embedding_file=image_embedding_file,
@@ -181,7 +276,7 @@ if __name__ == "__main__":
                               variable_length_input=True,
                               text_embedding_dim=text_embedding_dim,
                               include_item_categories=include_item_categories,
-                              image_data=image_data_type,
+                              image_data=args.image_data_type,
                               input_size=(3, 224, 224),
                               )
     valid_set = CustomDataset(valid_X,
@@ -189,7 +284,7 @@ if __name__ == "__main__":
                               item_dict,
                               pv_items,
                               image_dir=image_dir,
-                              max_len=max_seq_len,
+                              max_len=args.max_seq_len,
                               only_image=not include_text,
                               image_embedding_dim=image_embedding_dim,
                               image_embedding_file=image_embedding_file,
@@ -198,11 +293,22 @@ if __name__ == "__main__":
                               variable_length_input=True,
                               text_embedding_dim=text_embedding_dim,
                               include_item_categories=include_item_categories,
-                              image_data=image_data_type,
+                              image_data=args.image_data_type,
                               input_size=(3, 224, 224),
                               )
 
-    print(model_params)
+    param_table = PrettyTable(["Parameter", "Value"])
+    for k, v in model_params.items():
+        param_table.add_row([k, v])
+    print(param_table)
     print(f"Total Trainable Params: {total_params}")
     train(model, train_set, valid_set, device='cuda',
-          epochs=model_params['epochs'], batch_size=model_params['batch_size'], learning_rate=model_params['lr'])
+          epochs=model_params['epochs'], 
+          batch_size=model_params['batch_size'],
+          learning_rate=model_params['lr'],
+          loss_name=model_params['loss'],
+          clip_norm=model_params["clip_norm"])
+
+
+if __name__ == "__main__":
+    main()

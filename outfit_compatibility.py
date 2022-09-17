@@ -1,3 +1,5 @@
+import argparse
+from inspect import ArgSpec
 import os
 import json
 from collections import Counter
@@ -48,10 +50,73 @@ def get_accuracy_auc(data_gen, model):
     print(f"AUC: {auc}")
     return auc
 
+parser = argparse.ArgumentParser(description='Fashion Compatibility Example')
+parser.add_argument('--batch-size', type=int, default=256, metavar='N',
+                    help='input batch size for training (default: 256)')
+parser.add_argument('--epochs', type=int, default=50, metavar='N',
+                    help='number of epochs to train (default: 10)')
+parser.add_argument('--start_epoch', type=int, default=1, metavar='N',
+                    help='number of start epoch (default: 1)')
+parser.add_argument('--lr', type=float, default=5e-5, metavar='LR',
+                    help='learning rate (default: 5e-5)')
+parser.add_argument('--seed', type=int, default=1, metavar='S',
+                    help='random seed (default: 1)')
+parser.add_argument('--no-cuda', action='store_true', default=False,
+                    help='enables CUDA training')
+parser.add_argument('--log-interval', type=int, default=250, metavar='N',
+                    help='how many batches to wait before logging training status')
+parser.add_argument('--resume', default='', type=str,
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--name', default='Type_Specific_Fashion_Compatibility', type=str,
+                    help='name of experiment')
+parser.add_argument('--polyvore_split', default='disjoint', type=str,
+                    help='specifies the split of the polyvore data (either disjoint or nondisjoint)')
+parser.add_argument('--base_dir', default='/recsys_data/RecSys/fashion/polyvore-dataset/polyvore_outfits', type=str,
+                    help='directory of the polyvore outfits dataset (default: data)')
+parser.add_argument('--test', dest='test', action='store_true', default=False,
+                    help='To only run inference on test set')
+parser.add_argument('--dim_embed', type=int, default=64, metavar='N',
+                    help='how many dimensions in embedding (default: 64)')
+parser.add_argument('--l2_embed', dest='l2_embed', action='store_true', default=False,
+                    help='L2 normalize the output of the type specific embeddings')
+parser.add_argument('--image_embedding_dim', type=int, default=1280, metavar='M',
+                    help='image embedding dimension')
+parser.add_argument('--text_embedding_dim', type=int, default=768, metavar='M',
+                    help='text embedding dimension (BERT)')
+###
+parser.add_argument('--model_name', default='rnn', type=str,
+                    help='model name')
+parser.add_argument('--transformer_name', default='pytorch', type=str,
+                    help='Transformer name (different implementation)')
+parser.add_argument('--max_seq_len', type=int, default=8, metavar='M',
+                    help='maximum number of items in an outfit')
+parser.add_argument('--image_data_type', default='embedding', type=str,
+                    help='input type of images, one of embedding, original or both')
+parser.add_argument('--d_model', type=int, default=64, metavar='M',
+                    help='transformer embedding dimension')
+parser.add_argument('--patience', type=int, default=5, metavar='M',
+                    help='patience for model training')
+parser.add_argument('--n_heads', type=int, default=2, metavar='M',
+                    help='transformer number of heads')
+parser.add_argument('--n_layers', type=int, default=1, metavar='M',
+                    help='transformer number of layers')
+parser.add_argument('--dropout_rate', type=float, default=0.1, metavar='LR',
+                    help='dropout rate (default: 0.1)')
+parser.add_argument('--loss_name', default='focal', type=str,
+                    help='Loss type')
+parser.add_argument('--freeze_layers', type=int, default=0, metavar='M',
+                    help='number of layers to freeze (in ResNet models)')
+parser.add_argument('--clip_norm', type=float, default=0.5, metavar='CN',
+                    help='gradient clipping norm')
+parser.add_argument('--use_rnn', default=False, help='include RNN layer or not')
 
-if __name__ == "__main__":
-    base_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/polyvore_outfits"
-    data_type = "nondisjoint"  # "nondisjoint", "disjoint"
+
+def main():
+    global args
+    args = parser.parse_args()
+
+    base_dir = args.base_dir
+    data_type = args.polyvore_split  # "nondisjoint", "disjoint"
     train_dir = os.path.join(base_dir, data_type)
     image_dir = os.path.join(base_dir, "images")
     embed_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/precomputed"
@@ -65,12 +130,12 @@ if __name__ == "__main__":
     item_file = "polyvore_item_metadata.json"
     outfit_file = "polyvore_outfit_titles.json"
 
-    model_type = "rnn"  # "set-transformer", "rnn"
-    include_text = True
+    model_type = args.model_name  # "set-transformer", "rnn"
+    include_text = False
     use_image_embedding = True  # False # True
-    image_data_type = "embedding"  # "original", "embedding", "both"
+    image_data_type = args.image_data_type  # "original", "embedding", "both"
     image_encoder = "vgg16"  # "resnet50", "vgg16", "inception"
-    include_item_categories = True
+    include_item_categories = False
     use_graphsage = False
     if use_graphsage:
         image_embedding_dim, image_embedding_file = (
@@ -85,11 +150,11 @@ if __name__ == "__main__":
         768, os.path.join(embed_dir, "bert_polyvore.pkl"))
     # text_embedding_dim, text_embedding_file = (256, os.path.join(embed_dir, "triplet_polyvore_text.pkl"))
 
-    batch_size = 32
-    max_seq_len = 8
-    learning_rate = 1.0e-04
-    epochs = 100
-    patience = 5
+    batch_size = args.batch_size
+    max_seq_len = args.max_seq_len
+    learning_rate = args.lr
+    epochs = args.epochs
+    patience = args.patience
     reload_model = False
     rnn_d_model = 512
     rnn_dropout_rate = 0.5
@@ -356,4 +421,11 @@ if __name__ == "__main__":
     test_auc = get_accuracy_auc(test_gen, model)
 
     print(f"AUC: Valid {valid_auc:.4f} and Test {test_auc:.4f}")
+
+    model_path = f"compatibility_{data_type}_{model_type}_model_{max_seq_len}_only_image"
+    model.save(model_path)
+
     print("DONE!")
+
+if __name__ == "__main__":
+    main()

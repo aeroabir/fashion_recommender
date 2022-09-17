@@ -7,6 +7,8 @@ from SelfAttention_Family import FullAttention, AttentionLayer
 # from layers.Embed import DataEmbedding
 import sys
 import Resnet_18
+from hf_transformer import HFTRansformer
+from transformer_pytorch import TransformerEncoder
 
 
 class GLU(nn.Module):
@@ -187,6 +189,30 @@ class SimpleModel(nn.Module):
         out = self.final(y_image)
         return out
 
+
+def freeze_model_layers(model, freeze_layers=1):
+    """https://github.com/mortezamg63/Accessing-and-modifying-different-layers-of-a-pretrained-model-in-pytorch"""
+    child_counter = 0
+    for child in model.children():
+        if child_counter < freeze_layers:
+            print("child ",child_counter," was frozen")
+            for param in child.parameters():
+                param.requires_grad = False
+        elif child_counter == freeze_layers:
+            children_of_child_counter = 0
+            for children_of_child in child.children():
+                if children_of_child_counter < 1:
+                    for param in children_of_child.parameters():
+                        param.requires_grad = False
+                        print('child ', children_of_child_counter, 'of child',child_counter,' was frozen')
+                else:
+                    print('child ', children_of_child_counter, 'of child',child_counter,' was not frozen')
+                children_of_child_counter += 1
+        else:
+            print("child ",child_counter," was not frozen")
+        child_counter += 1
+    return model
+
 class BaseTransformer(nn.Module):
     def __init__(self, **kwargs):
         super(BaseTransformer, self).__init__()
@@ -197,30 +223,34 @@ class BaseTransformer(nn.Module):
         rate = kwargs.get("rate", 0.1)
         seed_value = kwargs.get("seed", 100)
         num_classes = kwargs.get("num_classes", 2)
-        lstm_dim = kwargs.get("lstm_dim", 32)
+        self.lstm_dim = kwargs.get("lstm_dim", 32)
         device = kwargs.get("device", "cpu")
         embedding_activation = kwargs.get("embedding_activation", "linear")
         encoder_activation = kwargs.get("encoder_activation", "relu")
         lstm_activation = kwargs.get("lstm_activation", "relu")
         final_activation = kwargs.get("final_activation", "sigmoid")
-        image_data_type = kwargs.get("image_data_type", "embedding")
-        include_text = kwargs.get("include_text", False)
+        self.image_data_type = kwargs.get("image_data_type", "embedding")
+        self.include_text = kwargs.get("include_text", False)
         image_embed_dim = kwargs.get("image_embed_dim", 1280)
         text_embed_dim = kwargs.get("text_embed_dim", 768)
         image_encoder = kwargs.get("image_encoder", "resnet18")
-        include_item_categories = kwargs.get("include_item_categories", False)
+        self.include_item_categories = kwargs.get("include_item_categories", False)
         num_categories = kwargs.get("num_categories", 154)
+        self.max_seq_len = kwargs.get("max_seq_len", 12)
+        self.transformer_name = kwargs.get("transformer_name", "yet-another")
+        self.freeze_layers = kwargs.get("freeze_layers", 0)
+        self.use_rnn = kwargs.get("use_rnn", False)
 
-        self.lstm_dim = lstm_dim
-        self.image_data_type = image_data_type
-        self.include_text = include_text
-        self.include_item_categories = include_item_categories
+        self.d_model = d_model
         d_model_trfmr = d_model
 
         if self.image_data_type in ["original", "both"]:
             if image_encoder == "resnet18":
                 self.image_embedder = Resnet_18.resnet18(
                     pretrained=True, embedding_size=d_model)
+                if self.freeze_layers > 0:
+                    self.image_embedder = freeze_model_layers(self.image_embedder,
+                        freeze_layers=self.freeze_layers)
 
         if self.image_data_type in ["embedding", "both"]:
             self.image_projector = nn.Sequential(
@@ -238,32 +268,77 @@ class BaseTransformer(nn.Module):
                 num_embeddings=num_categories, embedding_dim=d_model, padding_idx=0)
             d_model_trfmr += d_model
 
+        self.d_model_trfmr = d_model_trfmr
+
         # single transformer for all features
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model_trfmr,
-            nhead=num_heads,
-            dim_feedforward=dff,
-            dropout=rate,
-            batch_first=True,
-            activation=encoder_activation,
-        )
-        layer_norm = nn.LayerNorm(d_model_trfmr)
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers, norm=layer_norm,
-        )
+        if self.transformer_name == "pytorch":
+            # Pytorch native Transformer
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model_trfmr,
+                nhead=num_heads,
+                dim_feedforward=dff,
+                dropout=rate,
+                batch_first=True,
+                activation=encoder_activation,
+            )
+            layer_norm = nn.LayerNorm(d_model_trfmr)
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer, num_layers=num_layers, norm=layer_norm,
+            )
+            self.final = nn.Sequential(
+                nn.Linear(self.d_model_trfmr * self.max_seq_len, 1),
+            )
 
-        self.rnn = nn.LSTM(
-            input_size=d_model_trfmr,
-            hidden_size=lstm_dim,
-            num_layers=1,
-            bidirectional=True,
-            batch_first=True,
-        )
+        elif self.transformer_name == "huggingface":
+            # Huggingface Transformer - not giving good results
+            self.transformer = HFTRansformer(
+                num_layers=num_layers,
+                d_model=d_model,
+                num_heads=num_heads,
+                dff=dff,
+                rate=rate,
+                input_dim=d_model_trfmr,
+                add_pooling_layer=True,
+            )
+            self.final = nn.Sequential(
+                nn.Linear(self.d_model * self.max_seq_len, 1),
+            )
 
-        self.final = nn.Sequential(
-            nn.Linear(2 * lstm_dim, 1),
+        else:
+            # Another Transformer
+            self.transformer = TransformerEncoder(
+                n_layers=num_layers,
+                d_model=d_model,
+                n_head=num_heads,
+                ffn_hidden=dff,
+                drop_prob=rate,
+                input_dim=d_model_trfmr,
+                src_pad_idx=0,
+            )
+            self.final = nn.Sequential(
+                nn.Linear(self.d_model * self.max_seq_len, 1),
+            )
+
+        if self.use_rnn:
+            self.rnn = nn.LSTM(
+                input_size=d_model_trfmr,
+                hidden_size=self.lstm_dim,
+                num_layers=1,
+                bidirectional=True,
+                batch_first=True,
+            )
+            self.final = nn.Sequential(
+                nn.Linear(2 * self.lstm_dim, 1),
+                )
+
+        # self.final = nn.Sequential(
+            # only HF-transformer
+            # nn.Linear(self.d_model * self.max_seq_len, 1),
+            # nn.Linear(self.d_model_trfmr * self.max_seq_len, 1),  # only transformer
+            # nn.Linear(2 * lstm_dim * self.max_seq_len, 1),
+            # nn.Linear(2 * lstm_dim, 1),
             # nn.Sigmoid(),  # for binary classification
-        )
+        # )
 
         self.to(device)
 
@@ -271,8 +346,9 @@ class BaseTransformer(nn.Module):
         flat = []
         counter = 0
         x_image = x[counter]
+        seq_len = x_image.shape[1]
+        # print("Image:", x_image.shape)
         if self.image_data_type == "original":
-            seq_len = x_image.shape[1]
             y_image = []
             # since there is no TimeDistributed()
             for jj in range(seq_len):
@@ -295,6 +371,7 @@ class BaseTransformer(nn.Module):
             y_text = self.text_projector(x_text)
             # y_text = self.text_transformer(y_text)
             flat.append(y_text)
+            # print("Text:", x_text.shape)
 
         if self.include_item_categories:
             counter += 1
@@ -302,25 +379,52 @@ class BaseTransformer(nn.Module):
             y_cat = self.category_embedder(x_cat)
             flat.append(y_cat)
             src_key_mask = x_cat.eq(0)
+            # print("Category:", x_cat.shape)
 
         # last input, sequence length for each example in a batch
         counter += 1
         seq_lens = x[counter].to('cpu')
 
         y = torch.cat(flat, dim=-1)
+        # print("Before:", y.shape)
 
-        # https://stackoverflow.com/questions/62399243/transformerencoder-with-a-padding-mask
-        # y = self.transformer(y, src_key_padding_mask=src_key_mask)  # (?, s, h)
+        if self.transformer_name == "pytorch":
+            # https://stackoverflow.com/questions/62399243/transformerencoder-with-a-padding-mask
+            y = self.transformer(y, src_key_padding_mask=src_key_mask)  # (?, s, h=192)
+            # print("Transformer:", y.shape)
+            rnn_out = y.view(-1, self.max_seq_len * self.d_model_trfmr)
 
+        # Huggingface Transformer
+        elif self.transformer_name == "huggingface":
+            ys = self.transformer(inputs_embeds=y, attention_mask=src_key_mask)
+            y = ys.last_hidden_state
+            rnn_out = y.view(-1, self.max_seq_len * self.d_model)
+
+        else:
+            # yet another Transformer
+            y = self.transformer(inputs_embeds=y, attention_mask=x_cat)
+            # print("After:", y.shape)
+            rnn_out = y.view(-1, self.max_seq_len * self.d_model)
+
+
+        if self.use_rnn:
         # https://pytorch.org/docs/stable/generated/torch.nn.utils.rnn.pack_padded_sequence.html
-        y_padded = torch.nn.utils.rnn.pack_padded_sequence(
-            y, seq_lens, batch_first=True, enforce_sorted=False)
-        output, (h_N, c_N) = self.rnn(y_padded)
-        # output = (?, s, 2*h')
-        # h_N, c_N = (2, ?, h')
-        # batch_dim = x_image.shape[0]
-        h_N = h_N.view(-1, 2 * self.lstm_dim)  # (?, 2*h')
-        out = self.final(h_N)
+            y_padded = torch.nn.utils.rnn.pack_padded_sequence(
+                y, seq_lens, batch_first=True, enforce_sorted=False)
+            output, (h_N, c_N) = self.rnn(y_padded)
+            unpacked, unpacked_len = torch.nn.utils.rnn.pad_packed_sequence(output, batch_first=True)
+            # unpacked shape = [?, len*, 384], sequence length len* would be the maximum nonzero length
+            # output = (?, s*, 2*h')
+            # h_N, c_N = (2, ?, h')
+            # batch_dim = x_image.shape[0]
+            # print(h_N.shape, c_N.shape)
+            # print(unpacked.shape)
+            rnn_out = h_N.transpose(0, 1)  # (?, 2, h')
+            rnn_out = torch.flatten(rnn_out, 1, 2)  # (?, 2h')
+            # rnn_out = unpacked.view(-1, 2 * self.lstm_dim * seq_len)  # this will not work
+            # rnn_out = h_N.view(-1, 2 * self.lstm_dim)  # (?, 2*h')
+
+        out = self.final(rnn_out)
         return out
 
 

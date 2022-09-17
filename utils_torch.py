@@ -6,6 +6,7 @@ import numpy as np
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data as torch_data
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.functional import auc
@@ -15,6 +16,8 @@ from sklearn.metrics import roc_auc_score, accuracy_score
 import sys
 import time
 from tqdm import tqdm
+import inspect
+from typing import List, Optional, Tuple, Union, Set, Callable
 
 
 def default_image_loader(path):
@@ -346,9 +349,40 @@ class CustomDataset(torch_data.Dataset):
         return self.n
 
 
+class FocalLoss(nn.BCEWithLogitsLoss):
+    """
+    Focal loss for binary classification tasks on imbalanced datasets
+    https://gist.github.com/f1recracker/0f564fd48f15a58f4b92b3eb3879149b
+    https://pytorch.org/vision/0.12/_modules/torchvision/ops/focal_loss.html
+    https://amaarora.github.io/2020/06/29/FocalLoss.html
+    """
+
+    def __init__(self, gamma, alpha=None, reduction='none'):
+        super().__init__(weight=alpha, reduction='none')
+        self.reduction = reduction
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, input_, target):
+        p = torch.sigmoid(input_)
+        cross_entropy = super().forward(input_, target)
+        p_t = p * target + (1 - p) * (1 - target)
+        loss = torch.pow(1 - p_t, self.gamma) * cross_entropy
+        if self.alpha and self.alpha >= 0:
+            alpha_t = self.alpha * target + (1 - self.alpha) * (1 - target)
+            loss = alpha_t * loss
+
+        if self.reduction == "mean":
+            loss = loss.mean()
+        elif self.reduction == "sum":
+            loss = loss.sum()
+
+        return loss
+
+
 def train(model, train_set, valid_set, device, **kwargs):
 
-    epochs = kwargs.get("epoch", 100)
+    epochs = kwargs.get("epochs", 100)
     batch_size = kwargs.get("batch_size", 32)
     learning_rate = kwargs.get("learning_rate", 1e-05)
     decay_rate = kwargs.get("decay_rate", 0.5)
@@ -358,9 +392,18 @@ def train(model, train_set, valid_set, device, **kwargs):
     early_stop_step = kwargs.get("patience", 10)
     observe = kwargs.get("observe", "auc")
     optimizer = kwargs.get("optimizer", "adam")
+    loss_name = kwargs.get("loss_name", "focal")
+    clip_norm = kwargs.get("clip_norm", 0.5)
 
-    # criterion = nn.BCELoss(reduction="mean").to(device)
-    criterion = torch.nn.BCEWithLogitsLoss(reduction="mean").to(device)
+    if loss_name == "bce":
+        criterion = nn.BCELoss(reduction="mean").to(device)
+    elif loss_name == "bcewithlogit":
+        criterion = torch.nn.BCEWithLogitsLoss(reduction="mean").to(device)
+    elif loss_name == "focal":
+        criterion = FocalLoss(2.0, reduction="mean").to(device)
+    else:
+        print("Unknown loss!")
+        return
 
     if optimizer == "adam":
         my_optim = torch.optim.Adam(
@@ -421,7 +464,7 @@ def train(model, train_set, valid_set, device, **kwargs):
             # sys.exit()
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             my_optim.step()
 
             # print(i, float(loss))
@@ -449,7 +492,7 @@ def train(model, train_set, valid_set, device, **kwargs):
                 validate_score_non_decrease_count = 0
             else:
                 validate_score_non_decrease_count += 1
-                if validate_score_non_decrease_count == 5:
+                if validate_score_non_decrease_count == 4:
                     my_lr_scheduler.step()
             # save model
         #         if is_best_for_now:
@@ -465,8 +508,11 @@ def train(model, train_set, valid_set, device, **kwargs):
                 validate_score_non_decrease_count,
             )
         )
-        if early_stop and validate_score_non_decrease_count >= early_stop_step:
+        if early_stop and validate_score_non_decrease_count > early_stop_step:
+            print(
+                f"Exiting as the number of non-decrease count is greater than {early_stop_step}")
             break
+    print(f"Best valid AUC: {best_validate_auc:.4f}")
     return performance_metrics
 
 
@@ -525,3 +571,131 @@ def validate(model, dataloader, device, result_file=None):
         )
 
     return {"acc": scores[0], "auc": scores[1]}
+
+
+def prune_linear_layer(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) -> nn.Linear:
+    """
+    Prune a linear layer to keep only entries in index.
+    Used to remove heads.
+    Args:
+        layer (`torch.nn.Linear`): The layer to prune.
+        index (`torch.LongTensor`): The indices to keep in the layer.
+        dim (`int`, *optional*, defaults to 0): The dimension on which to keep the indices.
+    Returns:
+        `torch.nn.Linear`: The pruned layer as a new layer with `requires_grad=True`.
+    """
+    index = index.to(layer.weight.device)
+    W = layer.weight.index_select(dim, index).clone().detach()
+    if layer.bias is not None:
+        if dim == 1:
+            b = layer.bias.clone().detach()
+        else:
+            b = layer.bias[index].clone().detach()
+    new_size = list(layer.weight.size())
+    new_size[dim] = len(index)
+    new_layer = nn.Linear(
+        new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight.device)
+    new_layer.weight.requires_grad = False
+    new_layer.weight.copy_(W.contiguous())
+    new_layer.weight.requires_grad = True
+    if layer.bias is not None:
+        new_layer.bias.requires_grad = False
+        new_layer.bias.copy_(b.contiguous())
+        new_layer.bias.requires_grad = True
+    return new_layer
+
+
+def find_pruneable_heads_and_indices(
+    heads: List[int], n_heads: int, head_size: int, already_pruned_heads: Set[int]
+) -> Tuple[Set[int], torch.LongTensor]:
+    """
+    Finds the heads and their indices taking `already_pruned_heads` into account.
+    Args:
+        heads (`List[int]`): List of the indices of heads to prune.
+        n_heads (`int`): The number of heads in the model.
+        head_size (`int`): The size of each head.
+        already_pruned_heads (`Set[int]`): A set of already pruned heads.
+    Returns:
+        `Tuple[Set[int], torch.LongTensor]`: A tuple with the remaining heads and their corresponding indices.
+    """
+    mask = torch.ones(n_heads, head_size)
+    # Convert to set and remove already pruned heads
+    heads = set(heads) - already_pruned_heads
+    for head in heads:
+        # Compute how many pruned heads are before the head and move the index accordingly
+        head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+        mask[head] = 0
+    mask = mask.view(-1).contiguous().eq(1)
+    index: torch.LongTensor = torch.arange(len(mask))[mask].long()
+    return heads, index
+
+
+def apply_chunking_to_forward(
+    forward_fn: Callable[..., torch.Tensor], chunk_size: int, chunk_dim: int, *input_tensors
+) -> torch.Tensor:
+    """
+    This function chunks the `input_tensors` into smaller input tensor parts of size `chunk_size` over the dimension
+    `chunk_dim`. It then applies a layer `forward_fn` to each chunk independently to save memory.
+    If the `forward_fn` is independent across the `chunk_dim` this function will yield the same result as directly
+    applying `forward_fn` to `input_tensors`.
+    Args:
+        forward_fn (`Callable[..., torch.Tensor]`):
+            The forward function of the model.
+        chunk_size (`int`):
+            The chunk size of a chunked tensor: `num_chunks = len(input_tensors[0]) / chunk_size`.
+        chunk_dim (`int`):
+            The dimension over which the `input_tensors` should be chunked.
+        input_tensors (`Tuple[torch.Tensor]`):
+            The input tensors of `forward_fn` which will be chunked
+    Returns:
+        `torch.Tensor`: A tensor with the same shape as the `forward_fn` would have given if applied`.
+    Examples:
+    ```python
+    # rename the usual forward() fn to forward_chunk()
+    def forward_chunk(self, hidden_states):
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+    # implement a chunked forward function
+    def forward(self, hidden_states):
+        return apply_chunking_to_forward(self.forward_chunk, self.chunk_size_lm_head, self.seq_len_dim, hidden_states)
+    ```"""
+
+    assert len(
+        input_tensors) > 0, f"{input_tensors} has to be a tuple/list of tensors"
+
+    # inspect.signature exist since python 3.5 and is a python method -> no problem with backward compatibility
+    num_args_in_forward_chunk_fn = len(
+        inspect.signature(forward_fn).parameters)
+    if num_args_in_forward_chunk_fn != len(input_tensors):
+        raise ValueError(
+            f"forward_chunk_fn expects {num_args_in_forward_chunk_fn} arguments, but only {len(input_tensors)} input "
+            "tensors are given"
+        )
+
+    if chunk_size > 0:
+        tensor_shape = input_tensors[0].shape[chunk_dim]
+        for input_tensor in input_tensors:
+            if input_tensor.shape[chunk_dim] != tensor_shape:
+                raise ValueError(
+                    f"All input tenors have to be of the same shape: {tensor_shape}, "
+                    f"found shape {input_tensor.shape[chunk_dim]}"
+                )
+
+        if input_tensors[0].shape[chunk_dim] % chunk_size != 0:
+            raise ValueError(
+                f"The dimension to be chunked {input_tensors[0].shape[chunk_dim]} has to be a multiple of the chunk "
+                f"size {chunk_size}"
+            )
+
+        num_chunks = input_tensors[0].shape[chunk_dim] // chunk_size
+
+        # chunk input tensor into tuples
+        input_tensors_chunks = tuple(input_tensor.chunk(
+            num_chunks, dim=chunk_dim) for input_tensor in input_tensors)
+        # apply forward fn to every tuple
+        output_chunks = tuple(forward_fn(*input_tensors_chunk)
+                              for input_tensors_chunk in zip(*input_tensors_chunks))
+        # concatenate output at same dimension
+        return torch.cat(output_chunks, dim=chunk_dim)
+
+    return forward_fn(*input_tensors)
