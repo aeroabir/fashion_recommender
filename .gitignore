@@ -9,6 +9,7 @@ polyvore-dataset/
 *.png
 *.h5
 *.jpg
+*.jpeg
 /wandb/
 /finetuned_efficientnet/
 /logs/
@@ -21,3 +22,4 @@ polyvore-dataset/
 /Nordstrom/
 /STL-Dataset/
 /fashionIQ/
+/DeepFashion2_Dataset/

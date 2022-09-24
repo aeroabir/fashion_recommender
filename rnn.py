@@ -374,6 +374,8 @@ def build_multilevel_rnn_unequal(inp_seq_len, **kwargs):
     num_categories = kwargs.get("num_categories", 153)
     mask_zero = kwargs.get("mask_zero", True)
     image_encoder = kwargs.get("image_encoder", "resnet50")
+    include_style = kwargs.get("include_style", False)
+    num_styles = kwargs.get("num_styles", None)
 
     seed(seed_value)
     set_seed(seed_value)
@@ -444,6 +446,19 @@ def build_multilevel_rnn_unequal(inp_seq_len, **kwargs):
         category_embedded = rnn_encoder(category_embedded)
         inputs.append(in3)
         flat.append(category_embedded)
+
+    if include_style:
+        in4 = Input(shape=())  # (?,)
+        style_encoder = tf.keras.layers.Embedding(
+            input_dim=num_styles,
+            output_dim=d_model,
+            embeddings_initializer="uniform",
+            mask_zero=False,
+        )
+        style_embedded = style_encoder(in4)
+        style_embedded = tf.stack([style_embedded] * inp_seq_len, axis=1)
+        inputs.append(in4)
+        flat.append(style_embedded)
 
     if include_multihead_attention:
         mha = MultiHeadAttention(inp_seq_len, d_model, num_heads)
