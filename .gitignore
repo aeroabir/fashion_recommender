@@ -10,6 +10,7 @@ polyvore-dataset/
 *.h5
 *.jpg
 *.jpeg
+*.json
 /wandb/
 /finetuned_efficientnet/
 /logs/

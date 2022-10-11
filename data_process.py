@@ -14,6 +14,7 @@ import random
 import sys
 from tqdm import tqdm
 import uuid
+from numpy.random import default_rng
 
 # from transformers import BertTokenizer, BertModel
 
@@ -70,6 +71,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
         self.include_item_categories = kwargs.get(
             "include_item_categories", False)
         self.category_mask_zero = kwargs.get("category_mask_zero", True)
+        self.add_cls = kwargs.get("add_cls", False)
+        self.extra_embedding = kwargs.get("extra_embedding", None)
 
         # image data can be one of "embedding", "original", "both"
         # both - means both image and embeddings will be returned
@@ -118,6 +121,8 @@ class CustomDataGen(tf.keras.utils.Sequence):
             with open(self.image_embedding_file, "rb") as fr:
                 self.embedding_dict = pickle.load(fr)
 
+            if self.add_cls:
+                self.embedding_dict["[CLS]"] = self.extra_embedding[0]
             # self.model = tf.keras.models.Sequential(
             #     [
             #         tf.keras.layers.InputLayer(input_shape=[224, 224, 3]),
@@ -189,6 +194,10 @@ class CustomDataGen(tf.keras.utils.Sequence):
     def __get_input(self, example):
         data, nimage_data, ntext_data = [], [], []
         items = [self.item_dict[x] for x in example[: self.max_len]]
+        if self.add_cls:
+            items.insert(0, "[CLS]")
+            items = items[:self.max_len]
+
         for item in items:
             image = self.get_image(item)
             if self.only_image:
@@ -475,6 +484,8 @@ class ZalandoDataGen(tf.keras.utils.Sequence):
             "include_item_categories", False)
         self.include_text = kwargs.get("include_text", False)
         self.category_mask_zero = kwargs.get("category_mask_zero", True)
+        self.add_cls = kwargs.get("add_cls", False)
+        self.extra_embedding = kwargs.get("extra_embedding", None)
 
         # image data can be one of "embedding", "original", "both"
         # both - means both image and embeddings will be returned
@@ -519,6 +530,8 @@ class ZalandoDataGen(tf.keras.utils.Sequence):
             # "effnet2_zalando.pkl" - 1280 dimensional vector
             with open(self.image_embedding_file, "rb") as fr:
                 self.embedding_dict = pickle.load(fr)
+            if self.add_cls:
+                self.embedding_dict["[CLS]"] = self.extra_embedding[0]
 
         if self.include_text:
             # "bert_polyvore.pkl" - 768 dimensional vector
@@ -575,6 +588,9 @@ class ZalandoDataGen(tf.keras.utils.Sequence):
         data, nimage_data, ntext_data = [], [], []
         style = int(example[0])
         items = [x for x in example[1: self.max_len]]
+        if self.add_cls:
+            items.insert(0, "[CLS]")
+            items = items[:self.max_len]
         for item in items:
             image = self.get_image(item)
             if self.include_text:
@@ -2116,3 +2132,484 @@ class ZalandoOutfitGenWithImage(tf.keras.utils.Sequence):
     def __len__(self):
         return math.ceil(self.n / self.batch_size)
         # return self.n // self.batch_size
+
+
+class BertDataGen(tf.keras.utils.Sequence):
+    """
+    Generates samples for training a generic transformer model
+    that recognizes an outfit. It takes inputs from positive
+    samples, creates a modification of these samples and accordingly
+    generates positive or negative samples. All labels are binary.
+    """
+
+    def __init__(
+        self,
+        positive_samples,
+        item_description,
+        **kwargs,
+    ):
+        self.batch_size = kwargs.get("batch_size", 32)
+        self.shuffle = kwargs.get("shuffle", True)
+        self.get_image_embedding = kwargs.get("get_image_embedding", True)
+        self.image_embedding_file = kwargs.get("image_embedding_file", None)
+        self.text_embedding_file = kwargs.get("text_embedding_file", None)
+        self.max_example = kwargs.get("max_example", 100000)
+        self.item_description = item_description
+        self.image_embedding_dim = kwargs.get("image_embedding_dim", 1280)
+        self.input_size = kwargs.get("input_size", (224, 224, 3))
+        self.max_len = kwargs.get("max_items", 8)
+        self.image_dir = kwargs.get("image_dir", None)
+        self.mask_zero = kwargs.get("mask_zero", True)
+        self.extra_embedding = kwargs.get("extra_embedding", None)
+        self.max_samples_per_example = kwargs.get("max_samples_per_example", 1)
+
+        # build item->category dict
+        # collect all items by categories
+        self.items_by_category, self.item2cat = {}, {}
+        self.category2id = {}
+        if self.mask_zero:
+            category_count = 1
+            self.category_zero = 0
+        else:
+            category_count = 0
+            self.category_zero = -1
+
+        for item, desc in self.item_description.items():
+            cat = desc["category_id"]
+
+            # create a dict of category numbers
+            if cat not in self.category2id:
+                self.category2id[cat] = category_count
+                category_count += 1
+
+            self.item2cat[item] = cat
+            if cat in self.items_by_category:
+                self.items_by_category[cat].append(item)
+            else:
+                self.items_by_category[cat] = [item]
+        print(f"Total {category_count} item categories")
+        # print(self.category2id)
+
+        if self.get_image_embedding:
+            self.zero_elem_image = np.zeros(
+                self.image_embedding_dim
+            )  # np.zeros((1, 1280))
+        else:
+            self.zero_elem_image = np.zeros(self.input_size)
+
+        # create all the training data
+        X, y = [], []
+        Z = []
+        rng = default_rng()
+        for outfit in tqdm(positive_samples):
+            items = [o["item_id"] for o in outfit["items"]]
+            k = len(items)
+            num_samples = np.random.randint(
+                low=1, high=self.max_samples_per_example+1, size=1)[0]
+
+            # original, positive sample
+            X.append(["[CLS]"] + items)
+            y.append(1)
+            for _ in range(num_samples):
+                num_replace = np.random.randint(low=1, high=3, size=1)
+                replace_indices = rng.choice(
+                    k, size=num_replace, replace=False)
+                pos_items = [items[ii] for ii in replace_indices]
+                outfit_i = [items[ii]
+                            for ii in range(k) if ii not in replace_indices]
+
+                neg_items, neg_cat, outfit_cat = [], [], []
+                for item in pos_items:
+                    neg = self.get_negative_samples(item)[0]
+                    neg_items.append(neg)
+                    outfit_cat.append(self.category2id[self.item2cat[item]])
+                    neg_cat.append(self.category2id[self.item2cat[neg]])
+                    # print(pos_items, outfit_i)
+                X.append(["[CLS]"] + outfit_i + neg_items)
+                # X.append(["[CLS]"] + outfit_i + ["[SEP]"] + neg_items)
+                y.append(0)
+
+            if self.max_example and len(y) >= self.max_example:
+                break
+        self.df = pd.DataFrame({"X": X, "y": y})
+        self.X_col = "X"
+        self.y_col = "y"
+        self.n = len(self.df)
+        print(f"Total {self.n} examples")
+
+        if self.get_image_embedding:
+            # "effnet2_polyvore.pkl" - 1280 dimensional vector
+            # "effnet_tuned_polyvore.pkl" - 1280 dimensional vector
+            # "graphsage_dict_polyvore.pkl" - 50 dimension
+            # "graphsage_dict2_polyvore.pkl" - 50 dimension
+            with open(self.image_embedding_file, "rb") as fr:
+                self.embedding_dict = pickle.load(fr)
+            self.embedding_dict["[CLS]"] = self.extra_embedding[0]
+            # self.embedding_dict["[SEP]"] = self.extra_embedding[1]
+            # self.embedding_dict["[MASK]"] = self.extra_embedding[2]
+
+        # original data has all positives followed by all negatives
+        self.on_epoch_end()
+
+    def get_negative_samples(self, item_id, num_negative=1):
+        # for a given item get another item from the same category
+        item_cat = self.item2cat[item_id]
+        item_pool = self.items_by_category[item_cat].copy()
+        try:
+            item_pool.remove(item_id)
+        except:
+            print("cannot find!!")
+            print(item_id, item_cat)
+            print(item_pool)
+        neg_items = np.random.randint(
+            low=0, high=len(item_pool), size=num_negative)
+        neg_items = [item_pool[ii] for ii in neg_items]
+        return neg_items
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+    def get_image(self, item_id):
+        if self.get_image_embedding:
+            return self.embedding_dict[item_id]
+        image_path = os.path.join(self.image_dir, item_id + ".jpg")
+        image = tf.keras.preprocessing.image.load_img(image_path)
+        image_arr = tf.keras.preprocessing.image.img_to_array(image)
+        image_arr = tf.image.resize(
+            image_arr, (self.input_size[0], self.input_size[1])
+        ).numpy()
+        image_arr /= 255.0
+        # if self.get_image_embedding:
+        # return tf.squeeze(self.model(tf.expand_dims(image_arr, 0)))
+        return image_arr
+
+    def get_texts(self, item_id):
+        return self.text_embedding_dict[item_id]
+
+    def __get_input(self, example):
+        outfit = example[: self.max_len]
+        outfit_data = []
+        for ii in outfit:
+            outfit_data.append(self.get_image(ii))
+
+        if len(outfit) < self.max_len:
+            padding = [self.zero_elem_image for _ in range(
+                self.max_len - len(outfit))]
+            outfit_data = padding + outfit_data
+
+        return outfit_data
+
+    def __get_data(self, batches):
+        # Generates data containing batch_size samples
+        x_batch = batches["X"].tolist()
+        y_batch = batches["y"].tolist()
+        combined = [self.__get_input(x) for x in x_batch]
+        X_batch = np.asarray(combined)
+        y_batch = np.asarray([int(y) for y in y_batch])
+        return X_batch, y_batch
+
+    def __getitem__(self, index):
+        batches = self.df[index *
+                          self.batch_size: (index + 1) * self.batch_size]
+        X, y = self.__get_data(batches)
+        return X, y
+
+    def __len__(self):
+        return math.ceil(self.n / self.batch_size)
+
+
+def get_polyvore_data(config):
+    batch_size = config.batch_size
+    max_seq_len = config.max_seq_len
+    include_text = config.include_text
+    image_embedding_dim = config.image_embedding_dim
+    image_embedding_file = config.image_embedding_file
+    text_embedding_file = config.text_embedding_file
+    text_embedding_dim = config.text_embedding_dim
+    include_item_categories = config.include_item_categories
+    image_data_type = config.image_data_type
+
+    base_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/polyvore_outfits"
+    data_type = "nondisjoint"  # "nondisjoint", "disjoint"
+    train_dir = os.path.join(base_dir, data_type)
+    image_dir = os.path.join(base_dir, "images")
+    embed_dir = "/recsys_data/RecSys/fashion/polyvore-dataset/precomputed"
+    train_json = "train.json"
+    valid_json = "valid.json"
+    test_json = "test.json"
+
+    train_file = "compatibility_train.txt"
+    valid_file = "compatibility_valid.txt"
+    test_file = "compatibility_test.txt"
+    item_file = "polyvore_item_metadata.json"
+    outfit_file = "polyvore_outfit_titles.json"
+
+    with open(os.path.join(train_dir, train_json), 'r') as fr:
+        train_pos = json.load(fr)
+
+    with open(os.path.join(train_dir, valid_json), 'r') as fr:
+        valid_pos = json.load(fr)
+
+    with open(os.path.join(train_dir, test_json), 'r') as fr:
+        test_pos = json.load(fr)
+
+    with open(os.path.join(base_dir, item_file), 'r') as fr:
+        pv_items = json.load(fr)
+
+    with open(os.path.join(base_dir, outfit_file), 'r') as fr:
+        pv_outfits = json.load(fr)
+    print(f"Total {len(train_pos)}, {len(valid_pos)}, {len(test_pos)} outfits in train, validation and test split, respectively")
+
+    with open(os.path.join(train_dir, train_file), 'r') as fr:
+        train_X, train_y = [], []
+        for line in fr:
+            elems = line.strip().split()
+            train_y.append(elems[0])
+            train_X.append(elems[1:])
+
+    with open(os.path.join(train_dir, valid_file), 'r') as fr:
+        valid_X, valid_y = [], []
+        for line in fr:
+            elems = line.strip().split()
+            valid_y.append(elems[0])
+            valid_X.append(elems[1:])
+
+    with open(os.path.join(train_dir, test_file), 'r') as fr:
+        test_X, test_y = [], []
+        for line in fr:
+            elems = line.strip().split()
+            test_y.append(elems[0])
+            test_X.append(elems[1:])
+
+    print(f"Total {len(train_X)}, {len(valid_X)}, {len(test_X)} examples in train, validation and test split, respectively")
+
+    item_dict = {}
+    for ii, outfit in enumerate(train_pos):
+        items = outfit['items']
+        mapped = train_X[ii]
+        item_dict.update({jj: kk['item_id'] for jj, kk in zip(mapped, items)})
+    print(len(item_dict))
+
+    for ii, outfit in enumerate(valid_pos):
+        items = outfit['items']
+        mapped = valid_X[ii]
+        item_dict.update({jj: kk['item_id'] for jj, kk in zip(mapped, items)})
+    print(len(item_dict))
+
+    for ii, outfit in enumerate(test_pos):
+        items = outfit['items']
+        mapped = test_X[ii]
+        item_dict.update({jj: kk['item_id'] for jj, kk in zip(mapped, items)})
+    print(len(item_dict))
+
+    train_gen = CustomDataGen(train_X, train_y,
+                              item_dict,
+                              pv_items,
+                              image_dir=image_dir,
+                              batch_size=batch_size,
+                              max_len=max_seq_len,
+                              only_image=not include_text,
+                              image_embedding_dim=image_embedding_dim,
+                              image_embedding_file=image_embedding_file,
+                              text_embedding_file=text_embedding_file,
+                              number_items_in_batch=150,
+                              variable_length_input=True,
+                              text_embedding_dim=text_embedding_dim,
+                              include_item_categories=include_item_categories,
+                              image_data=image_data_type,
+                              add_cls=config.add_cls,
+                              extra_embedding=config.extra_embedding,
+                              )
+    valid_gen = CustomDataGen(valid_X, valid_y,
+                              item_dict,
+                              pv_items,
+                              image_dir=image_dir,
+                              batch_size=batch_size,
+                              max_len=max_seq_len,
+                              only_image=not include_text,
+                              image_embedding_dim=image_embedding_dim,
+                              image_embedding_file=image_embedding_file,
+                              text_embedding_file=text_embedding_file,
+                              number_items_in_batch=150,
+                              variable_length_input=True,
+                              text_embedding_dim=text_embedding_dim,
+                              include_item_categories=include_item_categories,
+                              image_data=image_data_type,
+                              add_cls=config.add_cls,
+                              extra_embedding=config.extra_embedding,
+                              )
+
+    test_gen = CustomDataGen(test_X, test_y,
+                             item_dict,
+                             pv_items,
+                             image_dir=image_dir,
+                             batch_size=batch_size,
+                             max_len=max_seq_len,
+                             only_image=not include_text,
+                             image_embedding_dim=image_embedding_dim,
+                             image_embedding_file=image_embedding_file,
+                             text_embedding_file=text_embedding_file,
+                             number_items_in_batch=150,
+                             variable_length_input=True,
+                             text_embedding_dim=text_embedding_dim,
+                             include_item_categories=include_item_categories,
+                             image_data=image_data_type,
+                             add_cls=config.add_cls,
+                             extra_embedding=config.extra_embedding,
+                             )
+
+    return train_gen, valid_gen, test_gen
+
+
+def get_zalando_data(config):
+
+    batch_size = config.batch_size
+    max_seq_len = config.max_seq_len
+    include_text = config.include_text
+    image_embedding_dim = config.image_embedding_dim
+    image_embedding_file = config.image_embedding_file
+    text_embedding_file = config.text_embedding_file
+    text_embedding_dim = config.text_embedding_dim
+    include_item_categories = config.include_item_categories
+    image_data_type = config.image_data_type
+
+    base_dir = "/recsys_data/RecSys/Zalando_Outfit/female/Outfit_Data"
+    train_dir = base_dir
+    image_dir = "/recsys_data/RecSys/Zalando_Outfit/resized_packshot_images_female"
+    embed_dir = "/recsys_data/RecSys/Zalando_Outfit/female/Outfit_Data/precomputed"
+    train_file = "compatibility_train.txt"
+    valid_file = "compatibility_valid.txt"
+    test_file = "compatibility_test.txt"
+    item_file = "polyvore_item_metadata.json"
+    with open(os.path.join(train_dir, train_file), 'r') as fr:
+        train_X, train_y = [], []
+        for line in fr:
+            elems = line.strip().split()
+            train_y.append(elems[0])
+            train_X.append(elems[1:])
+
+    with open(os.path.join(train_dir, valid_file), 'r') as fr:
+        valid_X, valid_y = [], []
+        for line in fr:
+            elems = line.strip().split()
+            valid_y.append(elems[0])
+            valid_X.append(elems[1:])
+
+    with open(os.path.join(train_dir, test_file), 'r') as fr:
+        test_X, test_y = [], []
+        for line in fr:
+            elems = line.strip().split()
+            test_y.append(elems[0])
+            test_X.append(elems[1:])
+
+    print(f"Total {len(train_X)}, {len(valid_X)}, {len(test_X)} examples in train, validation and test split, respectively")
+    item_dict = {}
+    train_file = "zalando_female_outfit_data_18k_and_new_modified_format_train.json"
+    valid_file = "zalando_female_outfit_data_18k_and_new_modified_format_val.json"
+    test_file = "zalando_female_outfit_data_18k_and_new_modified_format_test.json"
+
+    train_json = os.path.join(base_dir, "Train", train_file)
+    train_data = json.load(open(train_json, 'r'))
+
+    item2cat = {}
+    cat2item = {}
+    seq_lens = []
+    count = 0
+    for outfit in train_data:
+        items = outfit["item_ids"]
+        categories = outfit["high_level_cats"]
+        style = outfit["outfit_occasion"]
+        for i, c in zip(items, categories):
+            if c not in cat2item:
+                cat2item[c] = []
+            cat2item[c].append(i)
+            item2cat[i] = {"category_id": c}
+        seq_lens.append(len(items))
+        count += 1
+    print(f"{count} training examples, average {np.mean(seq_lens):.2f} items, max {np.max(seq_lens)} item")
+
+    valid_json = os.path.join(base_dir, "Val", valid_file)
+    valid_data = json.load(open(valid_json, 'r'))
+
+    count = 0
+    seq_lens = []
+    for outfit in valid_data:
+        items = outfit["item_ids"]
+        categories = outfit["high_level_cats"]
+        for i, c in zip(items, categories):
+            cat2item[c].append(i)
+            item2cat[i] = {"category_id": c}
+        seq_lens.append(len(items))
+        count += 1
+    print(f"{count} validation examples, average {np.mean(seq_lens):.2f} items, max {np.max(seq_lens)} items")
+
+    test_json = os.path.join(base_dir, "Test", test_file)
+    test_data = json.load(open(test_json, 'r'))
+
+    count = 0
+    seq_lens = []
+    for outfit in test_data:
+        items = outfit["item_ids"]
+        categories = outfit["high_level_cats"]
+        for i, c in zip(items, categories):
+            cat2item[c].append(i)
+            item2cat[i] = {"category_id": c}
+        seq_lens.append(len(items))
+        count += 1
+    print(f"{count} test examples, average {np.mean(seq_lens):.2f} items, max {np.max(seq_lens)} item")
+
+    train_gen = ZalandoDataGen(train_X, train_y,
+                               item2cat,
+                               image_dir=image_dir,
+                               batch_size=batch_size,
+                               max_len=max_seq_len,
+                               only_image=not include_text,
+                               image_embedding_dim=image_embedding_dim,
+                               image_embedding_file=image_embedding_file,
+                               text_embedding_file=text_embedding_file,
+                               number_items_in_batch=150,
+                               variable_length_input=True,
+                               text_embedding_dim=text_embedding_dim,
+                               include_item_categories=include_item_categories,
+                               image_data=image_data_type,
+                               add_cls=config.add_cls,
+                               extra_embedding=config.extra_embedding,
+                               )
+    valid_gen = ZalandoDataGen(valid_X, valid_y,
+                               item2cat,
+                               image_dir=image_dir,
+                               batch_size=batch_size,
+                               max_len=max_seq_len,
+                               only_image=not include_text,
+                               image_embedding_dim=image_embedding_dim,
+                               image_embedding_file=image_embedding_file,
+                               text_embedding_file=text_embedding_file,
+                               number_items_in_batch=150,
+                               variable_length_input=True,
+                               text_embedding_dim=text_embedding_dim,
+                               include_item_categories=include_item_categories,
+                               image_data=image_data_type,
+                               add_cls=config.add_cls,
+                               extra_embedding=config.extra_embedding,
+                               )
+
+    test_gen = ZalandoDataGen(test_X, test_y,
+                              item2cat,
+                              image_dir=image_dir,
+                              batch_size=batch_size,
+                              max_len=max_seq_len,
+                              only_image=not include_text,
+                              image_embedding_dim=image_embedding_dim,
+                              image_embedding_file=image_embedding_file,
+                              text_embedding_file=text_embedding_file,
+                              number_items_in_batch=150,
+                              variable_length_input=True,
+                              text_embedding_dim=text_embedding_dim,
+                              include_item_categories=include_item_categories,
+                              image_data=image_data_type,
+                              add_cls=config.add_cls,
+                              extra_embedding=config.extra_embedding,
+                              )
+
+    return train_gen, valid_gen, test_gen

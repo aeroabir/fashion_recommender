@@ -18,10 +18,94 @@ import time
 from tqdm import tqdm
 import inspect
 from typing import List, Optional, Tuple, Union, Set, Callable
+import glob
 
 
 def default_image_loader(path):
     return Image.open(path).convert('RGB')
+
+
+class ImageDataGen(torch_data.Dataset):
+    def __init__(
+        self,
+        item_description,
+        input_size=(3, 224, 224),
+        label_dict=None,
+        loader=default_image_loader,
+        shuffle=True,
+        valid=False,
+        valid_sample=0,
+        **kwargs,
+    ):
+        # item_description is a list of tuples
+        # first element of the tuple is the image path
+        # second element of the tuple if the category
+        self.item_description = item_description
+        X, y = [], []
+        for item_id, cat in self.item_description:
+            X.append(item_id)
+            y.append(cat)
+
+        self.X_col = "X"
+        self.y_col = "y"
+        self.df = pd.DataFrame({self.X_col: X, self.y_col: y})
+        self.label_dict = label_dict
+        self.num_classes = len(self.label_dict)
+        max_example = kwargs.get("max_example", None)
+        if max_example:
+            self.df = self.df.sample(n=max_example)
+        if valid:
+            self.df = self.df.sample(n=valid_sample)
+
+        self.input_size = input_size
+        self.shuffle = shuffle
+        self.n = len(self.df)
+        print(f"Total {self.n} images with {self.num_classes} classes")
+
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+
+        transform = transforms.Compose([
+            transforms.Resize(input_size[1]),
+            transforms.CenterCrop(input_size[1]),
+            transforms.ToTensor(),
+            normalize,
+        ])
+        self.transform = transform
+        self.loader = loader
+        self.on_epoch_end()
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            self.df = self.df.sample(frac=1).reset_index(drop=True)
+
+    def get_image(self, image_path):
+        image = self.loader(image_path)
+        # image = T.Resize(size=[224, 224])(image)
+        # image_arr = np.array(image, dtype=float)
+        # image_arr /= 255.0
+        # image_arr = torch.from_numpy(image_arr)
+        if self.transform is not None:
+            image_arr = self.transform(image)
+
+        return image_arr
+
+    def __get_input(self, example):
+        return self.get_image(example)
+
+    def __getitem__(self, index):
+        """ Returns a single sample as opposed to Tensorflow syntax
+            that returns a batch of samples
+        """
+        x = self.df.iloc[index]["X"]
+        y = torch.tensor(
+            int(self.label_dict[self.df.iloc[index]["y"]])).type(torch.long)
+        # X = torch.tensor(self.__get_input(x)).type(torch.float)
+        X = self.__get_input(x).type(torch.float)
+        return X, y
+
+    def __len__(self):
+        return self.n
 
 
 class CustomDataset(torch_data.Dataset):
@@ -380,6 +464,10 @@ class FocalLoss(nn.BCEWithLogitsLoss):
         return loss
 
 
+def save_model(model, path):
+    torch.save(model.state_dict(), path)
+
+
 def train(model, train_set, valid_set, device, **kwargs):
 
     epochs = kwargs.get("epochs", 100)
@@ -395,12 +483,25 @@ def train(model, train_set, valid_set, device, **kwargs):
     loss_name = kwargs.get("loss_name", "focal")
     clip_norm = kwargs.get("clip_norm", 0.5)
 
+    test_set = kwargs.get("test_set", None)
+    model_path = kwargs.get("model_path", None)
+
+    prob_type = None
     if loss_name == "bce":
         criterion = nn.BCELoss(reduction="mean").to(device)
+        prob_type = "binary"
     elif loss_name == "bcewithlogit":
         criterion = torch.nn.BCEWithLogitsLoss(reduction="mean").to(device)
+        prob_type = "binary"
     elif loss_name == "focal":
         criterion = FocalLoss(2.0, reduction="mean").to(device)
+        prob_type = "binary"
+    elif loss_name == "nll":
+        criterion = torch.nn.NLLLoss().to(device)
+        prob_type = "multi"
+    elif loss_name == "xent":
+        criterion = torch.nn.CrossEntropyLoss().to(device)
+        prob_type = "multi"
     else:
         print("Unknown loss!")
         return
@@ -430,10 +531,17 @@ def train(model, train_set, valid_set, device, **kwargs):
         valid_set, batch_size=batch_size, shuffle=False, num_workers=0
     )
     num_train_steps = len(train_set)//batch_size
+    num_valid_steps = len(valid_set)//batch_size
 
     dir_name = "indv"
-    log_dir = "logs/fit/" + dir_name + datetime.now().strftime("%Y%m%d-%H%M%S")
+    now = datetime.now()
+    dt_string = now.strftime("%Y%m%d-%H%M%S")
+    log_dir = "logs/fit/" + dir_name + dt_string
     writer = SummaryWriter(log_dir)
+    log_path = "logs/" + dt_string + ".log"
+    fw = open(log_path, "w")
+    fw.write("\t".join(["epoch", "train-loss",
+             "val-loss", "val-a[c,u]c"])+"\n")
 
     best_validate_auc = 0
     validate_score_non_decrease_count = 0
@@ -443,7 +551,8 @@ def train(model, train_set, valid_set, device, **kwargs):
         model.train()
         loss_total = 0
         cnt = 0
-        pbar = tqdm(enumerate(train_loader), total=num_train_steps)
+        pbar = tqdm(enumerate(train_loader),
+                    total=num_train_steps, leave=False)
         for i, (inputs, target) in pbar:
             if type(inputs) is list:
                 inputs = [inp.to(device) for inp in inputs]
@@ -457,22 +566,19 @@ def train(model, train_set, valid_set, device, **kwargs):
             my_optim.zero_grad()
 
             pred = model(inputs)
-            loss = criterion(pred, target)
+            if loss_name in ("nll", "xent"):
+                target = torch.squeeze(target)
 
-            # print(pred)
-            # print(target)
-            # sys.exit()
+            loss = criterion(pred, target)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
             my_optim.step()
 
-            # print(i, float(loss))
             pbar.set_description("loss %g" % float(loss))
             loss_total += float(loss)
             cnt += 1
 
-        # save_model(model, result_file, epoch)
         # if (epoch + 1) % exponential_decay_step == 0:
         #     my_lr_scheduler.step()
         if (epoch + 1) % validate_freq == 0:
@@ -481,11 +587,19 @@ def train(model, train_set, valid_set, device, **kwargs):
                 model,
                 valid_loader,
                 device,
-                result_file=None,
+                loss_name=loss_name,
+                num_steps=num_valid_steps,
             )
             writer.add_scalar("epoch_loss", loss_total / cnt, epoch)
-            writer.add_scalar("epoch_acc", performance_metrics["acc"], epoch)
-            writer.add_scalar("epoch_auc", performance_metrics["auc"], epoch)
+            if "acc" in performance_metrics:
+                writer.add_scalar(
+                    "epoch_acc", performance_metrics["acc"], epoch)
+            if "auc" in performance_metrics:
+                writer.add_scalar(
+                    "epoch_auc", performance_metrics["auc"], epoch)
+            if "loss" in performance_metrics:
+                writer.add_scalar("val_epoch_loss",
+                                  performance_metrics["loss"], epoch)
             if performance_metrics[observe] > best_validate_auc:
                 best_validate_auc = performance_metrics[observe]
                 is_best_for_now = True
@@ -495,25 +609,69 @@ def train(model, train_set, valid_set, device, **kwargs):
                 if validate_score_non_decrease_count == 4:
                     my_lr_scheduler.step()
             # save model
-        #         if is_best_for_now:
-        #             save_model(model, result_file)
+            if is_best_for_now:
+                save_model(model, model_path)
+
         # early stop
-        print(
-            "| Epoch {:3d} | time: {:5.2f}s | train_loss {:5.4f} | val-ACC {:5.4f} | val-AUC {:5.4f} ({:2d})".format(
-                epoch,
-                (time.time() - epoch_start_time),
-                loss_total / cnt,
-                performance_metrics["acc"],
-                performance_metrics["auc"],
-                validate_score_non_decrease_count,
+        if prob_type == "binary":
+            print(
+                "| Epoch {:3d} | time: {:5.2f}s | train-loss {:5.4f} | val-ACC {:5.4f} | val-AUC {:5.4f} ({:2d})".format(
+                    epoch,
+                    (time.time() - epoch_start_time),
+                    loss_total / cnt,
+                    performance_metrics["acc"],
+                    performance_metrics["auc"],
+                    validate_score_non_decrease_count,
+                )
             )
-        )
+            fw.write(
+                f"{epoch}\t{loss_total / cnt:.4f}\t{performance_metrics['acc']:.4f}\t{performance_metrics['auc']:.4f}\t{validate_score_non_decrease_count} \n")
+        elif prob_type == "multi":
+            print(
+                "| Epoch {:3d} | time: {:5.2f}s | train-loss {:5.4f} | val-loss {:5.4f} | val-ACC {:5.4f} ({:2d})".format(
+                    epoch,
+                    (time.time() - epoch_start_time),
+                    loss_total / cnt,
+                    performance_metrics["loss"],
+                    performance_metrics["acc"],
+                    validate_score_non_decrease_count,
+                )
+            )
+            fw.write(
+                f"{epoch}\t{loss_total / cnt:.4f}\t{performance_metrics['loss']:.4f}\t{performance_metrics['acc']:.4f}\t{validate_score_non_decrease_count} \n")
+
         if early_stop and validate_score_non_decrease_count > early_stop_step:
             print(
                 f"Exiting as the number of non-decrease count is greater than {early_stop_step}")
             break
-    print(f"Best valid AUC: {best_validate_auc:.4f}")
-    return performance_metrics
+    if prob_type == "binary":
+        print(f"Best valid AUC: {best_validate_auc:.4f}")
+        fw.write(f"Best valid AUC: {best_validate_auc:.4f}\n")
+    elif prob_type == "multi":
+        print(f"Best valid Accuracy: {best_validate_auc:.4f}")
+        fw.write(f"Best valid Accuracy: {best_validate_auc:.4f}\n")
+
+    if test_set is not None:
+        test_loader = torch_data.DataLoader(
+            test_set,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+        num_test_steps = len(test_set)//batch_size
+        test_metrics = validate(
+            model,
+            test_loader,
+            device,
+            loss_name=loss_name,
+            num_steps=num_test_steps,
+        )
+        print("Test results:", test_metrics)
+        fw.write(
+            f"TEST loss-{test_metrics['loss']:.4f}, acc-{test_metrics['acc']:.4f}\n")
+
+    fw.close()
+    return performance_metrics, test_metrics
 
 
 def evaluate(y, y_hat):
@@ -528,12 +686,31 @@ def evaluate(y, y_hat):
     return acc, auc
 
 
-def inference(model, dataloader, device):
+def cross_entropy_loss(y, yhat):
+    # numpy implementation of cross-entropy loss
+    # probabilities
+    phat = np.exp(yhat)/np.sum(np.exp(yhat), axis=0)
+    logphat = -np.log(phat)
+    loss = np.take_along_axis(logphat, np.expand_dims(y, axis=-1), 1)
+    return np.mean(loss)
+
+
+def evaluate_multiclass(y, y_hat, loss_name):
+    y_pred_class = np.argmax(y_hat, axis=1)
+    acc = accuracy_score(y, y_pred_class)
+    if loss_name == "nll":
+        criterion = torch.nn.NLLLoss()
+    elif loss_name == "xent":
+        loss = cross_entropy_loss(y, y_hat)
+    return acc, loss
+
+
+def inference(model, dataloader, device, num_steps):
     forecast_set = []
     target_set = []
     model.eval()
     with torch.no_grad():
-        for i, (inputs, target) in enumerate(dataloader):
+        for i, (inputs, target) in tqdm(enumerate(dataloader), total=num_steps, leave=False):
             if type(inputs) is list:
                 inputs = [inp.to(device) for inp in inputs]
             else:
@@ -545,32 +722,18 @@ def inference(model, dataloader, device):
     return np.concatenate(forecast_set, axis=0), np.concatenate(target_set, axis=0)
 
 
-def validate(model, dataloader, device, result_file=None):
+def validate(model, dataloader, device, loss_name, num_steps):
     # start = datetime.now()
-    forecast, target = inference(model, dataloader, device)
-    scores = evaluate(target, forecast)
-    if result_file:
-        if not os.path.exists(result_file):
-            os.makedirs(result_file)
-        step_to_print = 0
-        forcasting_2d = forecast[:, step_to_print, :]
-        forcasting_2d_target = target[:, step_to_print, :]
+    forecast, target = inference(model, dataloader, device, num_steps)
+    if loss_name in ("bce", "bcewithlogit", "focal"):
+        # Binary classification problem
+        scores = evaluate(target, forecast)
+        return {"acc": scores[0], "auc": scores[1]}
 
-        np.savetxt(f"{result_file}/target.csv",
-                   forcasting_2d_target, delimiter=",")
-        np.savetxt(f"{result_file}/predict.csv", forcasting_2d, delimiter=",")
-        np.savetxt(
-            f"{result_file}/predict_abs_error.csv",
-            np.abs(forcasting_2d - forcasting_2d_target),
-            delimiter=",",
-        )
-        np.savetxt(
-            f"{result_file}/predict_ape.csv",
-            np.abs((forcasting_2d - forcasting_2d_target) / forcasting_2d_target),
-            delimiter=",",
-        )
-
-    return {"acc": scores[0], "auc": scores[1]}
+    elif loss_name in ("nll", "xent"):
+        # Multi-class classification problem
+        scores = evaluate_multiclass(target, forecast, loss_name)
+        return {"acc": scores[0], "loss": scores[1]}
 
 
 def prune_linear_layer(layer: nn.Linear, index: torch.LongTensor, dim: int = 0) -> nn.Linear:
