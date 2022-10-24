@@ -2,6 +2,7 @@ from PIL import Image
 from datetime import datetime
 import pandas as pd
 import pickle
+import logging
 import numpy as np
 import os
 import torch
@@ -485,6 +486,7 @@ def train(model, train_set, valid_set, device, **kwargs):
 
     test_set = kwargs.get("test_set", None)
     model_path = kwargs.get("model_path", None)
+    logging = kwargs.get("logging", None)
 
     prob_type = None
     if loss_name == "bce":
@@ -505,6 +507,8 @@ def train(model, train_set, valid_set, device, **kwargs):
     else:
         print("Unknown loss!")
         return
+    if logging:
+        logging.info(f"loss: {criterion}, problem type: {prob_type}")
 
     if optimizer == "adam":
         my_optim = torch.optim.Adam(
@@ -546,6 +550,10 @@ def train(model, train_set, valid_set, device, **kwargs):
     best_validate_auc = 0
     validate_score_non_decrease_count = 0
     performance_metrics = {}
+    print(
+        f"Training for {epochs} epochs with batch-size of {batch_size} and learning rate = {learning_rate}")
+    logging.info(
+        f"Training for {epochs} epochs with batch-size of {batch_size} and learning rate = {learning_rate}")
     for epoch in range(epochs):
         epoch_start_time = time.time()
         model.train()
@@ -601,54 +609,73 @@ def train(model, train_set, valid_set, device, **kwargs):
                 writer.add_scalar("val_epoch_loss",
                                   performance_metrics["loss"], epoch)
             if performance_metrics[observe] > best_validate_auc:
+                if logging:
+                    logging.info(
+                        f"Performance improved, previous: {best_validate_auc}, current: {performance_metrics[observe]}")
                 best_validate_auc = performance_metrics[observe]
                 is_best_for_now = True
                 validate_score_non_decrease_count = 0
             else:
                 validate_score_non_decrease_count += 1
+                if logging:
+                    logging.info(
+                        f"Performance did not improve, previous: {best_validate_auc}, current: {performance_metrics[observe]}, count: {validate_score_non_decrease_count}")
                 if validate_score_non_decrease_count == 4:
+                    if logging:
+                        logging.info("Modifying learning rate")
                     my_lr_scheduler.step()
+
             # save model
-            if is_best_for_now:
+            if is_best_for_now and model_path:
                 save_model(model, model_path)
 
         # early stop
         if prob_type == "binary":
-            print(
-                "| Epoch {:3d} | time: {:5.2f}s | train-loss {:5.4f} | val-ACC {:5.4f} | val-AUC {:5.4f} ({:2d})".format(
-                    epoch,
-                    (time.time() - epoch_start_time),
-                    loss_total / cnt,
-                    performance_metrics["acc"],
-                    performance_metrics["auc"],
-                    validate_score_non_decrease_count,
-                )
+            out_str = "| Epoch {:3d} | time: {:5.2f}s | train-loss {:5.4f} | val-ACC {:5.4f} | val-AUC {:5.4f} ({:2d})".format(
+                epoch,
+                (time.time() - epoch_start_time),
+                loss_total / cnt,
+                performance_metrics["acc"],
+                performance_metrics["auc"],
+                validate_score_non_decrease_count,
             )
+            print(out_str)
+            if logging:
+                logging.info(out_str)
             fw.write(
                 f"{epoch}\t{loss_total / cnt:.4f}\t{performance_metrics['acc']:.4f}\t{performance_metrics['auc']:.4f}\t{validate_score_non_decrease_count} \n")
         elif prob_type == "multi":
-            print(
-                "| Epoch {:3d} | time: {:5.2f}s | train-loss {:5.4f} | val-loss {:5.4f} | val-ACC {:5.4f} ({:2d})".format(
-                    epoch,
-                    (time.time() - epoch_start_time),
-                    loss_total / cnt,
-                    performance_metrics["loss"],
-                    performance_metrics["acc"],
-                    validate_score_non_decrease_count,
-                )
+            out_str = "| Epoch {:3d} | time: {:5.2f}s | train-loss {:5.4f} | val-loss {:5.4f} | val-ACC {:5.4f} ({:2d})".format(
+                epoch,
+                (time.time() - epoch_start_time),
+                loss_total / cnt,
+                performance_metrics["loss"],
+                performance_metrics["acc"],
+                validate_score_non_decrease_count,
             )
+            print(out_str)
             fw.write(
                 f"{epoch}\t{loss_total / cnt:.4f}\t{performance_metrics['loss']:.4f}\t{performance_metrics['acc']:.4f}\t{validate_score_non_decrease_count} \n")
+            if logging:
+                logging.info(out_str)
 
         if early_stop and validate_score_non_decrease_count > early_stop_step:
             print(
                 f"Exiting as the number of non-decrease count is greater than {early_stop_step}")
+            if logging:
+                logging.info(
+                    f"Exiting as the number of non-decrease count is greater than {early_stop_step}")
             break
+
     if prob_type == "binary":
         print(f"Best valid AUC: {best_validate_auc:.4f}")
+        if logging:
+            logging.info(f"Best valid AUC: {best_validate_auc:.4f}")
         fw.write(f"Best valid AUC: {best_validate_auc:.4f}\n")
     elif prob_type == "multi":
         print(f"Best valid Accuracy: {best_validate_auc:.4f}")
+        if logging:
+            logging.info(f"Best valid Accuracy: {best_validate_auc:.4f}")
         fw.write(f"Best valid Accuracy: {best_validate_auc:.4f}\n")
 
     if test_set is not None:
@@ -669,6 +696,9 @@ def train(model, train_set, valid_set, device, **kwargs):
         print("Test results:", test_metrics)
         fw.write(
             f"TEST loss-{test_metrics['loss']:.4f}, acc-{test_metrics['acc']:.4f}\n")
+        if logging:
+            logging.info(
+                f"TEST loss-{test_metrics['loss']:.4f}, acc-{test_metrics['acc']:.4f}\n")
 
     fw.close()
     return performance_metrics, test_metrics

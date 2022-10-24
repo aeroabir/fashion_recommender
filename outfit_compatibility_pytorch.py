@@ -1,5 +1,6 @@
 import argparse
 import pandas as pd
+import logging
 import matplotlib.pyplot as plt
 import os
 import json
@@ -76,7 +77,8 @@ parser.add_argument('--freeze_layers', type=int, default=0, metavar='M',
                     help='number of layers to freeze (in ResNet models)')
 parser.add_argument('--clip_norm', type=float, default=0.5, metavar='CN',
                     help='gradient clipping norm')
-parser.add_argument('--use_rnn', default=False, help='include RNN layer or not')
+parser.add_argument('--use_rnn', default=False,
+                    help='include RNN layer or not')
 
 
 def main():
@@ -86,6 +88,24 @@ def main():
     torch.manual_seed(args.seed)
     if args.cuda:
         torch.cuda.manual_seed(args.seed)
+
+    # create a logger
+    logger = logging.getLogger()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(lineno)s - %(levelname)s - %(message)s')
+    logger.setLevel(logging.DEBUG)
+
+    now = datetime.now()
+    dt_string = now.strftime("%d_%m_%Y_%H_%M_%S")
+    log_filename = f"logs/pytorch_{dt_string}.log"
+    fhandler = logging.FileHandler(filename=log_filename, mode='w')
+    fhandler.setFormatter(formatter)
+    fhandler.setLevel(logging.INFO)
+    logger.addHandler(fhandler)
+
+    args_dict = vars(args)
+    for k, v in args_dict.items():
+        logging.info(f"{k}: {v}")
 
     base_dir = args.base_dir
     data_type = args.polyvore_split
@@ -162,6 +182,8 @@ def main():
         pv_outfits = json.load(fr)
 
     print(f"Total {len(train_pos)}, {len(valid_pos)}, {len(test_pos)} outfits in train, validation and test split, respectively")
+    logging.info(
+        f"Total {len(train_pos)}, {len(valid_pos)}, {len(test_pos)} positive examples in train, validation and test split, respectively")
 
     with open(os.path.join(train_dir, train_file), 'r') as fr:
         train_X, train_y = [], []
@@ -185,6 +207,8 @@ def main():
             test_X.append(elems[1:])
 
     print(f"Total {len(train_X)}, {len(valid_X)}, {len(test_X)} examples in train, validation and test split, respectively")
+    logging.info(
+        f"Total {len(train_X)}, {len(valid_X)}, {len(test_X)} examples in train, validation and test split, respectively")
 
     # Create a dict that maps encoded item-id to actual item-id
     item_dict = {}
@@ -279,6 +303,7 @@ def main():
                               image_data=args.image_data_type,
                               input_size=(3, 224, 224),
                               )
+
     valid_set = CustomDataset(valid_X,
                               valid_y,
                               item_dict,
@@ -297,17 +322,43 @@ def main():
                               input_size=(3, 224, 224),
                               )
 
+    test_set = CustomDataset(test_X,
+                             test_y,
+                             item_dict,
+                             pv_items,
+                             image_dir=image_dir,
+                             max_len=args.max_seq_len,
+                             only_image=not include_text,
+                             image_embedding_dim=image_embedding_dim,
+                             image_embedding_file=image_embedding_file,
+                             text_embedding_file=text_embedding_file,
+                             number_items_in_batch=150,
+                             variable_length_input=True,
+                             text_embedding_dim=text_embedding_dim,
+                             include_item_categories=include_item_categories,
+                             image_data=args.image_data_type,
+                             input_size=(3, 224, 224),
+                             )
+
     param_table = PrettyTable(["Parameter", "Value"])
+    logging.info("Model Parameters:")
     for k, v in model_params.items():
         param_table.add_row([k, v])
+        logging.info(f"{k}: {v}")
+
     print(param_table)
-    print(f"Total Trainable Params: {total_params}")
+    print(f"Total Trainable Params: {total_params//1e06} M")
+    logging.info(f"Total Trainable Params: {total_params//1e06} M")
+
     train(model, train_set, valid_set, device='cuda',
-          epochs=model_params['epochs'], 
+          epochs=model_params['epochs'],
           batch_size=model_params['batch_size'],
           learning_rate=model_params['lr'],
           loss_name=model_params['loss'],
-          clip_norm=model_params["clip_norm"])
+          clip_norm=model_params["clip_norm"],
+          logging=logging,
+          test_set=test_set,
+          )
 
 
 if __name__ == "__main__":
